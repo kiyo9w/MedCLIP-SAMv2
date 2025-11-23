@@ -18,7 +18,8 @@ import random
 import numpy as np
 from transformers import CLIPProcessor, CLIPModel, CLIPTokenizerFast
 from PIL import Image
-from scripts.methods import vision_heatmap_iba
+from scripts.methods import vision_heatmap_iba, vision_heatmap_tgcam
+from scripts.tgcam_components import TGCAMPipeline
 from text_prompts import *
 
 # Disable parallel tokenization warnings
@@ -32,7 +33,7 @@ def calculate_dice_coefficient(mask1, mask2):
     return dice_coefficient
 
 # Function to evaluate a model on a sample image and calculate the Dice score
-def evaluate_on_sample(model, processor, tokenizer, text, image_paths, args):
+def evaluate_on_sample(model, processor, tokenizer, text, image_paths, args, tgcam_instance=None):
     dice_scores = []  # Store Dice scores for each image
     for image_id in tqdm(image_paths):  # Iterate through images
         try:
@@ -47,8 +48,18 @@ def evaluate_on_sample(model, processor, tokenizer, text, image_paths, args):
         # Tokenize the input text
         text_ids = torch.tensor([tokenizer.encode(text, add_special_tokens=True)]).to(args.device)
         
-        # Generate a visual attention map using a custom method
-        vmap = vision_heatmap_iba(text_ids, image_feat, model, args.vlayer, args.vbeta, args.vvar, ensemble=args.ensemble, progbar=False)
+        # Generate a visual attention map using TGCAM (default) or IBA (if use_iba flag is set)
+        if hasattr(args, 'use_iba') and args.use_iba:
+            vmap = vision_heatmap_iba(text_ids, image_feat, model, args.vlayer, args.vbeta, args.vvar, ensemble=args.ensemble, progbar=False)
+        else:
+            # Use TGCAM (symmetric attention) - new default
+            vmap = vision_heatmap_tgcam(
+                text_ids, image_feat, model, 
+                layer_idx=args.vlayer,
+                tgcam_instance=tgcam_instance,
+                device=args.device,
+                **vars(args)
+            )
         
         # Load the ground truth mask for comparison
         gt_path = args.val_path.replace("images", "masks")
@@ -156,7 +167,12 @@ def main(args):
         text = str(input("Enter the text: "))
 
     # Perform hyperparameter optimization if required
+    # Note: Hyperparameter optimization currently only works with IBA method
     if(args.hyper_opt):
+        if not hasattr(args, 'use_iba') or not args.use_iba:
+            print("Warning: Hyperparameter optimization currently only supports IBA method.")
+            print("Switching to IBA for hyperparameter optimization...")
+            args.use_iba = True
         best_combo = hyper_opt(model, processor, tokenizer, text, args)
         args.vbeta = best_combo['vbeta']
         args.vvar = best_combo['vvar']
@@ -167,6 +183,22 @@ def main(args):
     # Create the output directory if it does not exist
     if(not os.path.exists(args.output_path)):
         os.makedirs(args.output_path)
+
+    # --- INITIALIZE TGCAM ONCE (OUTSIDE LOOP) ---
+    tgcam_model = None
+    if not args.use_iba:
+        print(f"⚡ Initializing Global TGCAM Pipeline (Common Dim: {args.common_dim})...")
+        tgcam_model = TGCAMPipeline(
+            visual_dim=768,  # Verify for your model
+            text_dim=768,
+            mid_channels=args.common_dim,
+            num_item_iterations=args.num_item_iterations
+        ).to(args.device)
+        tgcam_model.eval()
+        
+        # Explicitly disable gradients for all TGCAM parameters
+        for param in tgcam_model.parameters():
+            param.requires_grad = False
 
     # Iterate through the input images and generate saliency maps
     for image_id in tqdm(sorted(os.listdir(args.input_path))):
@@ -190,8 +222,18 @@ def main(args):
         image_feat = processor(images=image, return_tensors="pt")['pixel_values'].to(args.device)
         text_ids = torch.tensor([tokenizer.encode(text, add_special_tokens=True)]).to(args.device)
         
-        # Generate visual saliency map
-        vmap = vision_heatmap_iba(text_ids, image_feat, model, args.vlayer, args.vbeta, args.vvar, ensemble=args.ensemble, progbar=False)
+        # Generate visual saliency map using TGCAM (default) or IBA (if use_iba flag is set)
+        if hasattr(args, 'use_iba') and args.use_iba:
+            vmap = vision_heatmap_iba(text_ids, image_feat, model, args.vlayer, args.vbeta, args.vvar, ensemble=args.ensemble, progbar=False)
+        else:
+            # Use TGCAM (symmetric attention) - new default
+            vmap = vision_heatmap_tgcam(
+                text_ids, image_feat, model, 
+                layer_idx=args.vlayer,
+                tgcam_instance=tgcam_model, # Pass the initialized model
+                device=args.device,
+                **vars(args)
+            )
 
         # Resize and save the saliency map
         img = np.array(image)
@@ -201,13 +243,13 @@ def main(args):
 # Entry point for the script
 if __name__ == '__main__':
     # Define argument parser for input/output paths and hyperparameters
-    parser = argparse.ArgumentParser('M2IB argument parser')
+    parser = argparse.ArgumentParser('TGCAM/IBAM2IB argument parser')
     parser.add_argument('--input-path', required=True, default="data/input_images", type=str, help='path to the images')
     parser.add_argument('--output-path', required=True, default="saliency_map_outputs", type=str, help='path to the output')
     parser.add_argument('--val-path', type=str, default="data/val_images", help='path to the validation set for hyperparameter optimization')
-    parser.add_argument('--vbeta', type=float, default=0.1)
-    parser.add_argument('--vvar', type=float, default=1.0)
-    parser.add_argument('--vlayer', type=int, default=7)
+    parser.add_argument('--vbeta', type=float, default=0.1, help='Beta parameter for IBA (only used if --use-iba is set)')
+    parser.add_argument('--vvar', type=float, default=1.0, help='Variance parameter for IBA (only used if --use-iba is set)')
+    parser.add_argument('--vlayer', type=int, default=7, help='Layer index for feature extraction')
     parser.add_argument('--tbeta', type=float, default=0.3)
     parser.add_argument('--tvar', type=float, default=1)
     parser.add_argument('--tlayer', type=int, default=9)
@@ -219,6 +261,9 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument('--json-path', type=str, default="busi.json", help="Path to the JSON file containing the text prompts")
     parser.add_argument('--reproduce', action='store_true')
+    parser.add_argument('--use-iba', action='store_true', help='Use legacy IBA/M2IB method instead of TGCAM (default: False, uses TGCAM)')
+    parser.add_argument('--common-dim', type=int, default=512, help='Common dimension for CAM fusion (TGCAM only)')
+    parser.add_argument('--num-item-iterations', type=int, default=2, help='Number of ITEM refinement iterations (TGCAM only)')
     args = parser.parse_args()
     main(args)
 
