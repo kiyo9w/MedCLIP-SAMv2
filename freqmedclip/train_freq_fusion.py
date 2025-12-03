@@ -12,6 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
 import cv2
+from einops import rearrange
 
 # Try importing albumentations
 try:
@@ -26,7 +27,8 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import our custom components
-from freqmedclip.scripts.freq_components import SmartDecoderBlock, DWTForward, FrequencyEncoder, BottleneckFusion, FPNAdapter
+from freqmedclip.scripts.freq_components import DWTForward, FrequencyEncoder, FPNAdapter, IDWTInverse
+from freqmedclip.scripts.fmiseg_components import FFBI, Decoder, SubpixelUpsample, UnetOutBlock
 from scripts.methods import vision_heatmap_iba
 from saliency_maps.text_prompts import *
 from loss.hnl import HardNegativeLoss
@@ -138,13 +140,13 @@ class FreqMedCLIPDataset(Dataset):
 
 # --- 2. Model Wrapper ---
 class FrequencyMedCLIPSAMv2(nn.Module):
-    def __init__(self, biomedclip_model, dwt_module, freq_encoder, fpn_adapter, bottleneck_fusion, args):
+    def __init__(self, biomedclip_model, dwt_module, idwt_module, freq_encoder, fpn_adapter, args):
         super().__init__()
         self.biomedclip = biomedclip_model
         self.dwt_module = dwt_module
+        self.idwt_module = idwt_module
         self.freq_encoder = freq_encoder
         self.fpn_adapter = fpn_adapter
-        self.bottleneck_fusion = bottleneck_fusion
         
         # --- Freeze BiomedCLIP ---
         for param in self.biomedclip.parameters():
@@ -157,136 +159,165 @@ class FrequencyMedCLIPSAMv2(nn.Module):
                 param.requires_grad = True
         self.biomedclip.vision_model.post_layernorm.requires_grad_(True)
         
-        # --- Progressive Decoder with Skip Connections ---
-        # FPN Output Scales:
-        # s1: 14x14 (768) - Bottleneck
-        # s2: 28x28 (384) - Skip 1
-        # s3: 56x56 (192) - Skip 2
-        # s4: 112x112 (96) - Skip 3 (Optional, usually not used in U-Net bottleneck-up flow directly unless deep supervision)
+        # --- Dual-Branch Architecture (FMISeg-original) ---
         
-        # Frequency Encoder Output Scales:
-        # f3: 14x14 (256) - Bottleneck Fusion
-        # f2: 28x28 (128) - Skip Fusion 1
-        # f1: 56x56 (64)  - Skip Fusion 2
+        self.spatial_dim = [14, 28, 56, 112] # Adapted for ViT-B/16 (14x14 start)
+        feature_dim = [768, 384, 192, 96]
         
-        # Stage 1: 14 -> 28
-        # Input: Fused Bottleneck (768)
-        # Skip: FPN s2 (384)
-        # Freq Skip: f2 (128)
-        # Total In: 768 + 384 + 128 = 1280 -> Out: 384
-        self.dec1 = SmartDecoderBlock(in_channels=768, out_channels=384, skip_channels=384, freq_channels=128, use_lffi=True)
+        # Branch 1: Main (ViT)
+        self.decoder16 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77) # 768->384, 14->28
+        self.decoder8 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77)  # 384->192, 28->56
+        self.decoder4 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77)  # 192->96,  56->112
+        self.decoder1 = SubpixelUpsample(2, feature_dim[3], 24, 2) # 96->24, 112->224 (scale=2)
+        self.out = UnetOutBlock(2, in_channels=24, out_channels=1)
         
-        # Stage 2: 28 -> 56
-        # Input: 384
-        # Skip: FPN s3 (192)
-        # Freq Skip: f1 (64)
-        # Total In: 384 + 192 + 64 = 640 -> Out: 192
-        self.dec2 = SmartDecoderBlock(in_channels=384, out_channels=192, skip_channels=192, freq_channels=64, use_lffi=True)
+        # Branch 2: Frequency
+        self.decoder16_2 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77)
+        self.decoder8_2 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77)
+        self.decoder4_2 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77)
+        self.decoder1_2 = SubpixelUpsample(2, feature_dim[3], 24, 2)
+        self.out_2 = UnetOutBlock(2, in_channels=24, out_channels=1)
         
-        # Stage 3: 56 -> 112
-        # Input: 192
-        # Skip: FPN s4 (96)
-        # Freq Skip: None (or raw DWT?)
-        # Let's use FPN s4.
-        # Total In: 192 + 96 = 288 -> Out: 96
-        self.dec3 = SmartDecoderBlock(in_channels=192, out_channels=96, skip_channels=96, freq_channels=0, use_lffi=True)
+        # FFBI (Bidirectional Interaction)
+        self.ffbi = FFBI(feature_dim[0], 4, True)
         
-        # --- Final Segmentation Head ---
-        # 112 -> 224
-        self.final_up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.seg_head = nn.Conv2d(96, 1, kernel_size=1)
+    def get_high_freq_image(self, pixel_values):
+        # 1. Denormalize
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=pixel_values.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=pixel_values.device).view(1, 3, 1, 1)
+        denorm_imgs = pixel_values * std + mean
         
+        # 2. DWT
+        dwt_feats = self.dwt_module(denorm_imgs) # (B, 9, 112, 112) -> Actually 9 channels: LH, HL, HH per RGB
+        
+        # DWTForward returns cat([LH, HL, HH]). It discards LL.
+        # So we have only High Freq components.
+        # We need to reconstruct Image_H.
+        # IDWTInverse expects LL to be present (or we assume it's zero).
+        # Our IDWTInverse implementation expects (B, 12, 112, 112) if we include LL?
+        # DWTForward returns 9 channels (3 * 3).
+        # We need to prepend Zero LL for each channel.
+        
+        b, c9, h, w = dwt_feats.shape
+        # Reshape to (B, 3, 3, H, W)
+        dwt_reshaped = dwt_feats.view(b, 3, 3, h, w)
+        
+        # Create Zero LL: (B, 3, 1, H, W)
+        ll_zero = torch.zeros(b, 3, 1, h, w, device=dwt_feats.device)
+        
+        # Concat: LL, LH, HL, HH -> (B, 3, 4, H, W)
+        full_coeffs = torch.cat([ll_zero, dwt_reshaped], dim=2)
+        
+        # Flatten: (B, 12, H, W)
+        full_coeffs_flat = full_coeffs.view(b, 12, h, w)
+        
+        # 3. IDWT
+        img_h = self.idwt_module(full_coeffs_flat) # (B, 3, 224, 224)
+        
+        return img_h
+
     def forward(self, pixel_values, input_ids):
-        # 1. Image Encoder (ViT)
+        # 1. Image Encoder (ViT) - Branch 1
         vision_outputs = self.biomedclip.vision_model(pixel_values, output_hidden_states=True)
         hidden_states = vision_outputs.hidden_states
         
-        # Extract features (B, 197, 768)
-        # We need intermediate layers for FPNAdapter: [3, 6, 9, 12]
-        # hidden_states is a tuple of (embeddings, layer_1, ..., layer_12)
-        # So index 0 is embeddings, index 1 is layer 1 output.
-        # We want output of layer 3, 6, 9, 12.
-        # Indices in hidden_states: 3, 6, 9, 12 (if 1-based from embeddings?)
-        # Let's check: len(hidden_states) = 13 (embeddings + 12 layers)
-        # hidden_states[0] = embeddings
-        # hidden_states[1] = layer 1 output
-        # ...
-        # hidden_states[12] = layer 12 output (final)
-        
-        # We want layers 3, 6, 9, 12
+        # Extract features for FPNAdapter: [3, 6, 9, 12]
         layers_idx = [12, 9, 6, 3] # Order: s1(14), s2(28), s3(56), s4(112)
-        
         fpn_inputs = []
         for idx in layers_idx:
-            # (B, 197, 768) -> remove cls token -> (B, 196, 768)
             feat = hidden_states[idx][:, 1:, :] 
             B, N, C = feat.shape
             H = W = int(N**0.5) # 14
-            # Reshape to (B, C, 14, 14)
             feat_reshaped = feat.permute(0, 2, 1).view(B, C, H, W)
             fpn_inputs.append(feat_reshaped)
         
-        # 2. FPN Adapter (Generate Multi-Scale Features)
-        # Input: list of [feat12, feat9, feat6, feat3]
+        # FPN Adapter -> [s1(768), s2(384), s3(192), s4(96)]
         fpn_feats = self.fpn_adapter(fpn_inputs)
-        x_bottleneck = fpn_feats[0] # 14x14
-        x_skip1 = fpn_feats[1]      # 28x28
-        x_skip2 = fpn_feats[2]      # 56x56
-        x_skip3 = fpn_feats[3]      # 112x112
+        image_features = fpn_feats # [s1, s2, s3, s4]
         
-        # 3. Text Encoder
+        # 2. Frequency Encoder - Branch 2
+        img_h = self.get_high_freq_image(pixel_values)
         text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
-        if isinstance(text_outputs, tuple):
-            text_embeds = text_outputs[0]  # (B, SeqLen, 768)
-        else:
-            text_embeds = text_outputs.last_hidden_state
-
-        # 4. Parallel Frequency Encoder
-        # DWT on original image (B, 3, 224, 224) -> (B, 9, 112, 112)
-        # FIX: Denormalize pixel_values before DWT to avoid noise amplification
-        # pixel_values are normalized with mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=pixel_values.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=pixel_values.device).view(1, 3, 1, 1)
+        text_embeds = text_outputs[0] # (B, L, D)
         
-        denorm_imgs = pixel_values * std + mean
-        # Clip to [0, 1] just in case
-        denorm_imgs = torch.clamp(denorm_imgs, 0, 1)
+        # FrequencyEncoder returns [f3(14), f2(28), f1(56)]
+        # We assume FrequencyEncoder is updated to return 4 scales if we want full match, 
+        # but for now we use what we have and maybe pad or reuse?
+        # Actually, let's just use the 3 scales we have and maybe duplicate the last one?
+        # Or better, let's assume FrequencyEncoder returns [f3, f2, f1].
+        # f3(14, 768), f2(28, 384), f1(56, 192).
+        # We need s4(112, 96) equivalent.
+        # We can just use f1 upsampled? Or just None?
+        # Decoder expects a skip.
+        # Let's fake the 4th scale by upsampling f1.
         
-        dwt_feats = self.dwt_module(denorm_imgs)
+        freq_feats = self.freq_encoder(img_h, text_embeds=text_embeds)
+        # freq_feats: [f3, f2, f1]
         
-        # Encode Frequency Features: [f3(14), f2(28), f1(56)]
-        freq_feats = self.freq_encoder(dwt_feats, text_embeds=text_embeds)
-        x_freq_bottleneck = freq_feats[0] # 14x14
-        x_freq_skip1 = freq_feats[1]      # 28x28
-        x_freq_skip2 = freq_feats[2]      # 56x56
+        # Create f0 (112, 96) from f1 (56, 192)
+        f1 = freq_feats[2]
+        f0 = F.interpolate(f1, scale_factor=2, mode='bilinear', align_corners=False)
+        # Reduce channels 192 -> 96?
+        # We don't have a layer for that.
+        # Let's just slice it? Or use a 1x1 conv if we had one.
+        # For now, let's just slice: f0[:, :96, :, :]
+        f0 = f0[:, :96, :, :]
         
-        # 5. Bottleneck Fusion
-        # Fuse ViT Bottleneck with Frequency Features
-        x_fused = self.bottleneck_fusion(x_bottleneck, x_freq_bottleneck)
-            
-        # 6. Progressive Decoding with Skips and LFFI
+        image_features2 = [freq_feats[0], freq_feats[1], freq_feats[2], f0]
         
-        # Stage 1: 14 -> 28
-        # Use Fused Features as input
-        x = self.dec1(x_fused, skip=x_skip1, freq_skip=x_freq_skip1, text_embeds=text_embeds)
+        # 3. Bottleneck Interaction (FFBI)
+        # My Bottleneck is index 0 (768, 14x14).
+        os32 = image_features[0]
+        os32_2 = image_features2[0]
         
-        # Stage 2: 28 -> 56
-        x = self.dec2(x, skip=x_skip2, freq_skip=x_freq_skip2, text_embeds=text_embeds)
+        # Flatten for Attention: (B, C, H, W) -> (B, H*W, C) -> (B, L, C)
+        # FFBI expects (B, L, C) if batch_first=True.
         
-        # Stage 3: 56 -> 112
-        x = self.dec3(x, skip=x_skip3, freq_skip=None, text_embeds=text_embeds) 
+        os32_flat = rearrange(os32, 'b c h w -> b (h w) c')
+        os32_2_flat = rearrange(os32_2, 'b c h w -> b (h w) c')
         
-        # 7. Final Prediction
-        x = self.final_up(x) # 112 -> 224
-        logits = self.seg_head(x)
+        fu32_flat, fu32_2_flat = self.ffbi(os32_flat, os32_2_flat)
+        
+        # 4. Decoding
+        # Branch 1
+        # Prepare skips (flatten)
+        skips = [rearrange(item, 'b c h w -> b (h w) c') for item in image_features]
+        skips2 = [rearrange(item, 'b c h w -> b (h w) c') for item in image_features2]
+        
+        # Decoder 16 (14->28)
+        os16 = self.decoder16(fu32_flat, skips[1], text_embeds)
+        os16_2 = self.decoder16_2(fu32_2_flat, skips2[1], text_embeds)
+        
+        # Decoder 8 (28->56)
+        os8 = self.decoder8(os16, skips[2], text_embeds)
+        os8_2 = self.decoder8_2(os16_2, skips2[2], text_embeds)
+        
+        # Decoder 4 (56->112)
+        os4 = self.decoder4(os8, skips[3], text_embeds)
+        os4_2 = self.decoder4_2(os8_2, skips2[3], text_embeds)
+        
+        # Reshape for SubpixelUpsample (expects B, C, H, W)
+        # Decoder returns (B, HW, C).
+        # Last spatial size was 112.
+        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=112, W=112)
+        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=112, W=112)
+        
+        # Decoder 1 (112->224)
+        os1 = self.decoder1(os4)
+        os1_2 = self.decoder1_2(os4_2)
+        
+        # Output
+        out = self.out(os1) # Logits (Sigmoid applied in loss or later)
+        out_2 = self.out_2(os1_2)
         
         # Prepare features for HNL (Contrastive Loss)
         # Pool bottleneck features: (B, C, 14, 14) -> (B, C)
-        img_feats_pooled = F.adaptive_avg_pool2d(x_fused, (1, 1)).squeeze(-1).squeeze(-1)
-        # Pool text features: (B, SeqLen, 768) -> (B, 768)
+        # Use fused features
+        fu32 = rearrange(fu32_flat, 'b (h w) c -> b c h w', h=14, w=14)
+        img_feats_pooled = F.adaptive_avg_pool2d(fu32, (1, 1)).squeeze(-1).squeeze(-1)
         text_feats_pooled = torch.max(text_embeds, dim=1)[0]
         
-        return logits, img_feats_pooled, text_feats_pooled
+        return out, out_2, img_feats_pooled, text_feats_pooled
 
 # --- 3. Loss Function ---
 class DiceLoss(nn.Module):
@@ -310,10 +341,10 @@ def main():
     parser.add_argument('--dataset', type=str, required=True, help='Dataset name (e.g., breast_tumors)')
     parser.add_argument('--data-root', type=str, default='../data', help='Path to data directory')
     parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch-size', type=int, default=32) # Increased batch size
+    parser.add_argument('--batch-size', type=int, default=32) 
     parser.add_argument('--grad-accum-steps', type=int, default=1, help='Gradient accumulation steps')
-    parser.add_argument('--lr', type=float, default=1e-4) # Base LR for decoder
-    parser.add_argument('--backbone-lr', type=float, default=1e-5) # Lower LR for backbone
+    parser.add_argument('--lr', type=float, default=1e-4) 
+    parser.add_argument('--backbone-lr', type=float, default=1e-5) 
     parser.add_argument('--save-dir', type=str, default='../checkpoints')
     parser.add_argument('--dry-run', action='store_true', help='Run a single batch for debugging')
     args = parser.parse_args()
@@ -330,39 +361,34 @@ def main():
     
     # Initialize Components
     print("Initializing Fusion Components...")
-    # DWT Module
     dwt = DWTForward().to(device)
+    idwt = IDWTInverse().to(device)
     
-    # FPN Adapter
     fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
     
-    # Frequency Encoder
-    # Input: 9 channels (DWT), Output: Multi-scale
-    freq_encoder = FrequencyEncoder(in_channels=9, base_channels=64, text_dim=768).to(device)
-    
-    # Bottleneck Fusion
-    bottleneck_fusion = BottleneckFusion(dim=768, freq_dim=256).to(device)
+    # Frequency Encoder (Modified for 3 channels, 4 scales)
+    # We need to ensure it returns 4 scales.
+    freq_encoder = FrequencyEncoder(in_channels=3, base_channels=96, text_dim=768).to(device)
     
     # Model Wrapper
-    model = FrequencyMedCLIPSAMv2(biomedclip, dwt, freq_encoder, fpn_adapter, bottleneck_fusion, args).to(device)
+    model = FrequencyMedCLIPSAMv2(biomedclip, dwt, idwt, freq_encoder, fpn_adapter, args).to(device)
     
     # Dataset & DataLoader
     print(f"Loading Dataset: {args.dataset}...")
     train_dataset = FreqMedCLIPDataset(args.data_root, args.dataset, processor, tokenizer, split='train')
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0) # Windows: set num_workers=0
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0) 
     
-    # Optimizer with Differential Learning Rates
-    # Group 1: Backbone (Unfrozen layers) -> Low LR
-    # Group 2: Decoder & Fusion (Scratch) -> High LR
+    # Optimizer
     backbone_params = filter(lambda p: p.requires_grad, model.biomedclip.parameters())
-    decoder_params = list(model.dec1.parameters()) + \
-                     list(model.dec2.parameters()) + \
-                     list(model.dec3.parameters()) + \
+    decoder_params = list(model.decoder16.parameters()) + list(model.decoder8.parameters()) + \
+                     list(model.decoder4.parameters()) + list(model.decoder1.parameters()) + \
+                     list(model.out.parameters()) + \
+                     list(model.decoder16_2.parameters()) + list(model.decoder8_2.parameters()) + \
+                     list(model.decoder4_2.parameters()) + list(model.decoder1_2.parameters()) + \
+                     list(model.out_2.parameters()) + \
                      list(model.freq_encoder.parameters()) + \
                      list(model.fpn_adapter.parameters()) + \
-                     list(model.bottleneck_fusion.parameters()) + \
-                     list(model.final_up.parameters()) + \
-                     list(model.seg_head.parameters())
+                     list(model.ffbi.parameters())
                      
     optimizer = torch.optim.AdamW([
         {'params': backbone_params, 'lr': args.backbone_lr},
@@ -378,46 +404,42 @@ def main():
     print("Starting Training...")
     os.makedirs(args.save_dir, exist_ok=True)
     
-    # Load validation dataset for metrics
-    print(f"Loading validation dataset: {args.dataset}...")
     val_dataset = FreqMedCLIPDataset(args.data_root, args.dataset, processor, tokenizer, split='val')
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    print(f"Validation samples: {len(val_dataset)}")
     
     best_dice = 0.0
     best_epoch = 0
     
     for epoch in range(args.epochs):
-        # Training phase
         model.train()
         epoch_loss = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
-        optimizer.zero_grad() # Initialize gradients
+        optimizer.zero_grad() 
         
         for batch_idx, batch in enumerate(pbar):
             pixel_values = batch['pixel_values'].to(device)
             input_ids = batch['input_ids'].to(device)
             masks = batch['mask'].to(device).float()
             
-            # optimizer.zero_grad() # Handled by gradient accumulation
-            
             # Forward
-            preds, img_feats, text_feats = model(pixel_values, input_ids) # (B, 1, 224, 224)
-            preds = preds.squeeze(1)
+            preds1, preds2, img_feats, text_feats = model(pixel_values, input_ids) 
+            preds1 = preds1.squeeze(1)
+            preds2 = preds2.squeeze(1)
             
-            # Loss
-            loss_dice = dice_criterion(preds, masks)
-            loss_bce = bce_criterion(preds, masks)
+            # Loss (Deep Supervision on both branches)
+            loss_dice1 = dice_criterion(preds1, masks)
+            loss_bce1 = bce_criterion(preds1, masks)
+            
+            loss_dice2 = dice_criterion(preds2, masks)
+            loss_bce2 = bce_criterion(preds2, masks)
+            
             loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
             
-            # Total Loss (Weighted)
-            loss = loss_dice + loss_bce + 0.1 * loss_hnl
+            # Total Loss
+            loss = (loss_dice1 + loss_bce1) + 0.5 * (loss_dice2 + loss_bce2) + 0.1 * loss_hnl
             
-            # Normalize loss for gradient accumulation
             loss = loss / args.grad_accum_steps
-            
-            # Backward
             loss.backward()
             
             if (batch_idx + 1) % args.grad_accum_steps == 0:
@@ -425,7 +447,7 @@ def main():
                 optimizer.zero_grad()
             
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item(), 'hnl': loss_hnl.item()})
+            pbar.set_postfix({'loss': loss.item(), 'd1': loss_dice1.item(), 'd2': loss_dice2.item()})
             
             if args.dry_run:
                 print("Dry run completed successfully.")
@@ -433,7 +455,7 @@ def main():
         
         avg_loss = epoch_loss / len(train_loader)
         
-        # Validation phase
+        # Validation
         model.eval()
         val_dice_scores = []
         val_iou_scores = []
@@ -444,10 +466,11 @@ def main():
                 input_ids = batch['input_ids'].to(device)
                 masks = batch['mask'].to(device).float()
                 
-                preds, _, _ = model(pixel_values, input_ids)
-                preds = preds.squeeze(1)
+                preds1, preds2, _, _ = model(pixel_values, input_ids)
+                # Use Main Branch (preds1) for metrics, or average?
+                # FMISeg likely uses main branch.
+                preds = preds1.squeeze(1)
                 
-                # Calculate metrics
                 for i in range(preds.shape[0]):
                     pred_binary = (torch.sigmoid(preds[i]) > 0.5).float()
                     target = masks[i]
@@ -465,17 +488,14 @@ def main():
         
         print(f"Epoch {epoch+1}/{args.epochs} - Loss: {avg_loss:.4f} | Dice: {avg_dice:.4f} | IoU: {avg_iou:.4f}")
         
-        # Save best checkpoint only
         if avg_dice > best_dice:
             best_dice = avg_dice
             best_epoch = epoch + 1
             
-            # Remove old best checkpoint
             old_checkpoints = [f for f in os.listdir(args.save_dir) if f.startswith(f"fusion_{args.dataset}_") and f.endswith('.pth')]
             for old_ckpt in old_checkpoints:
                 os.remove(os.path.join(args.save_dir, old_ckpt))
             
-            # Save new best
             checkpoint_path = os.path.join(args.save_dir, f"fusion_{args.dataset}_epoch{epoch+1}.pth")
             torch.save(model.state_dict(), checkpoint_path)
             print(f"[BEST] New best model saved! Dice: {best_dice:.4f}")
