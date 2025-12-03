@@ -7,11 +7,14 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 from transformers import AutoModel, AutoProcessor, AutoTokenizer
+import cv2
+import matplotlib.pyplot as plt
 
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from freqmedclip.scripts.freq_components import SmartFusionBlock, DWTForward
+# Import components
+from freqmedclip.scripts.freq_components import DWTForward, FrequencyEncoder, FPNAdapter, IDWTInverse
 from freqmedclip.train_freq_fusion import FreqMedCLIPDataset, FrequencyMedCLIPSAMv2
 
 def calculate_metrics(pred, target, threshold=0.5):
@@ -43,7 +46,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, required=True)
     parser.add_argument('--checkpoint', type=str, required=True)
-    parser.add_argument('--data-root', type=str, default='../data'))
+    parser.add_argument('--data-root', type=str, default='../data')
     parser.add_argument('--batch-size', type=int, default=4)
     args = parser.parse_args()
     
@@ -58,24 +61,42 @@ def main():
     biomedclip = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(device)
     
     # Initialize components
-    print("Loading trained model...")
+    print("Initializing components...")
     dwt = DWTForward().to(device)
-    fusion = SmartFusionBlock(hf_channels=777, lf_channels=1, out_channels=32).to(device)
-    
-    # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    fusion.load_state_dict(checkpoint)
-    print(f"✓ Loaded checkpoint: {args.checkpoint}")
+    idwt = IDWTInverse().to(device)
+    fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
+    freq_encoder = FrequencyEncoder(in_channels=3, base_channels=96, text_dim=768).to(device)
     
     # Create model
-    class Args:
-        pass
-    model_args = Args()
-    model = FrequencyMedCLIPSAMv2(biomedclip, fusion, dwt, model_args).to(device)
+    # Note: args passed here are just for config if needed, we can pass a dummy object or the parser args
+    model = FrequencyMedCLIPSAMv2(biomedclip, dwt, idwt, freq_encoder, fpn_adapter, args).to(device)
+    
+    # Load checkpoint
+    print(f"Loading checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    
+    # Handle state dict keys if they were saved with 'module.' prefix or similar
+    # Also handle if checkpoint is full state dict or just model state dict
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+        
+    # Load state dict
+    try:
+        model.load_state_dict(state_dict)
+    except Exception as e:
+        print(f"Warning: Strict loading failed ({e}). Trying with strict=False...")
+        model.load_state_dict(state_dict, strict=False)
+        
     model.eval()
+    print("✓ Model loaded successfully")
     
     # Load test dataset
     print(f"\nLoading test dataset: {args.dataset}...")
+    # Note: Using 'test' split. Ensure 'test_images' and 'test_masks' exist in data root.
+    # If not, user might want to use 'val' or 'train' for testing.
+    # We'll assume 'test' as per user code, but fallback to 'val' if needed could be an option.
     test_dataset = FreqMedCLIPDataset(args.data_root, args.dataset, processor, tokenizer, split='test')
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
     print(f"Test samples: {len(test_dataset)}")
@@ -102,7 +123,10 @@ def main():
             img_names = batch['img_name']
             
             # Forward
-            preds = model(pixel_values, input_ids).squeeze(1)
+            # Model returns: out, out_2, img_feats_pooled, text_feats_pooled
+            # We use 'out' (Main Branch) for evaluation
+            preds1, preds2, _, _ = model(pixel_values, input_ids)
+            preds = preds1.squeeze(1)
             
             # Calculate metrics and save visualizations for each sample in batch
             for i in range(preds.shape[0]):
@@ -115,7 +139,6 @@ def main():
                     mask_np = masks[i].cpu().numpy()
                     
                     # Create visualization
-                    import matplotlib.pyplot as plt
                     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                     
                     # Ground truth
@@ -172,7 +195,8 @@ def main():
     print(f"  Recall:      {avg_metrics['recall']:.4f} ± {std_metrics['recall']:.4f}")
     
     # Save results
-    results_file = f"results_{args.dataset}_epoch{args.checkpoint.split('epoch')[-1].split('.')[0]}.txt"
+    ckpt_name = os.path.basename(args.checkpoint).replace('.pth', '')
+    results_file = f"results_{args.dataset}_{ckpt_name}.txt"
     with open(results_file, 'w') as f:
         f.write(f"Dataset: {args.dataset}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")

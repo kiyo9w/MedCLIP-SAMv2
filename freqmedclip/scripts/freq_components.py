@@ -382,25 +382,129 @@ class SmartDecoderBlock(nn.Module):
             
         return x
 
-class DWTForward(nn.Module):
+
+class IDWTInverse(nn.Module):
     """
-    Discrete Wavelet Transform (DWT) implementation for PyTorch.
+    Inverse Discrete Wavelet Transform (IDWT) implementation for PyTorch.
+    Reconstructs image from frequency features.
     """
     def __init__(self):
-        super(DWTForward, self).__init__()
+        super(IDWTInverse, self).__init__()
+        # Kernels from DWTForward (Haar)
+        # ll: 0.70710678 * [[1, 1], [1, 1]]
+        # lh: 0.70710678 * [[-1, 1], [-1, 1]]
+        # hl: 0.70710678 * [[-1, -1], [1, 1]]
+        # hh: 0.70710678 * [[1, -1], [-1, 1]]
+        
+        # For IDWT, we use the same coefficients but arranged for Transposed Conv
+        # or we can manually implement the reconstruction.
+        # Reconstruction:
+        # x = (LL*ll + LH*lh + HL*hl + HH*hh)
+        # Since the forward transform used 1/sqrt(2) scaling, the inverse should also use it (if orthogonal).
+        # We need to check the exact reconstruction formula for these kernels.
+        
         ll = torch.tensor([[0.70710678, 0.70710678], [0.70710678, 0.70710678]])      
         lh = torch.tensor([[-0.70710678, 0.70710678], [-0.70710678, 0.70710678]])   
         hl = torch.tensor([[-0.70710678, -0.70710678], [0.70710678, 0.70710678]])   
         hh = torch.tensor([[0.70710678, -0.70710678], [-0.70710678, 0.70710678]])   
 
-        kernels = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1)
+        # Stack kernels: (In_Channels, Out_Channels/Groups, KH, KW)
+        # For ConvTranspose2d: (In, Out, K, K)
+        # We process each channel independently (groups=C)
+        
+        kernels = torch.stack([ll, lh, hl, hh], dim=0).unsqueeze(1) # (4, 1, 2, 2)
         self.register_buffer('kernels', kernels)
 
-    def forward(self, x):
-        b, c, h, w = x.shape
-        x_reshaped = x.view(b * c, 1, h, w)
-        out = F.conv2d(x_reshaped, self.kernels, stride=2, padding=0)
-        out = out.view(b, c, 4, h // 2, w // 2)
-        freq_features = torch.cat([out[:, :, 1], out[:, :, 2], out[:, :, 3]], dim=1)
-        return freq_features
+    def forward(self, freq_features):
+        # freq_features: (B, C*4, H/2, W/2) or (B, C, 4, H/2, W/2)
+        # DWTForward returns: freq_features = torch.cat([out[:, :, 1], out[:, :, 2], out[:, :, 3]], dim=1)
+        # It discards LL (index 0).
+        # But for IDWT we need LL.
+        # If input is just HF, we assume LL is zero.
+        
+        if freq_features.dim() == 5:
+             # (B, C, 4, H/2, W/2)
+             x = freq_features
+             b, c, _, h, w = x.shape
+             x_reshaped = x.view(b, c*4, h, w)
+        else:
+             # Assume input is (B, C*4, H/2, W/2)
+             x_reshaped = freq_features
+             b, c_4, h, w = x_reshaped.shape
+             c = c_4 // 4
+        
+        # We need to handle the case where we might process C channels.
+        # ConvTranspose2d with groups=C.
+        # Input: (B, C*4, H, W). Output: (B, C, 2H, 2W).
+        # Weight: (In, Out/Groups, K, K) -> (C*4, 1, 2, 2) ?
+        # No, standard ConvTranspose2d weight is (In, Out, K, K).
+        # If groups=C, In must be divisible by groups.
+        
+        # Let's do it per channel or reshape.
+        # View as (B*C, 4, H, W)
+        x_flat = x_reshaped.view(b*c, 4, h, w)
+        
+        # Weight: (4, 1, 2, 2)
+        out = F.conv_transpose2d(x_flat, self.kernels, stride=2, padding=0)
+        # Out: (B*C, 1, 2H, 2W)
+        
+        out = out.view(b, c, 2*h, 2*w)
+        return out
+
+class FrequencyEncoder(nn.Module):
+    """
+    Parallel Encoder for Frequency Features.
+    Processes HF Image (3 channels) and returns multi-scale features.
+    """
+    def __init__(self, in_channels=3, base_channels=64, text_dim=768):
+        super().__init__()
+        
+        # Input: (B, 3, 224, 224) (HF Image)
+        
+        # Layer 1: 224 -> 112
+        self.layer0 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels),
+            nn.ReLU(inplace=True)
+        )
+        # Layer 2: 112 -> 56 (Output Scale 3)
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*2),
+            nn.ReLU(inplace=True)
+        )
+        self.se1 = TextGuidedSEBlock(base_channels*2, text_dim)
+        
+        # Layer 3: 56 -> 28 (Output Scale 2)
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(base_channels*2, base_channels*4, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*4),
+            nn.ReLU(inplace=True)
+        )
+        self.se2 = TextGuidedSEBlock(base_channels*4, text_dim)
+        
+        # Layer 4: 28 -> 14 (Output Scale 1)
+        self.layer3 = nn.Sequential(
+            nn.Conv2d(base_channels*4, base_channels*8, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*8),
+            nn.ReLU(inplace=True)
+        )
+        self.se3 = TextGuidedSEBlock(base_channels*8, text_dim)
+        
+    def forward(self, x, text_embeds=None):
+        # x: 224x224
+        f0 = self.layer0(x) # 112x112
+        
+        f1 = self.layer1(f0) # 56x56
+        if text_embeds is not None: f1 = self.se1(f1, text_embeds)
+        
+        f2 = self.layer2(f1) # 28x28
+        if text_embeds is not None: f2 = self.se2(f2, text_embeds)
+        
+        f3 = self.layer3(f2) # 14x14
+        if text_embeds is not None: f3 = self.se3(f3, text_embeds)
+        
+        # Return [14x14, 28x28, 56x56]
+        return [f3, f2, f1]
+
 
