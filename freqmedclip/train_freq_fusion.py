@@ -27,7 +27,8 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import our custom components
-from freqmedclip.scripts.freq_components import FrequencyEncoder, FPNAdapter
+from freqmedclip.scripts.freq_components import FPNAdapter, haar_dwt
+from freqmedclip.scripts.new_freq_encoder import ConvNeXtTiny12Ch # New Encoder
 from freqmedclip.scripts.fmiseg_components import FFBI, Decoder, SubpixelUpsample, UnetOutBlock
 from scripts.methods import vision_heatmap_iba
 from saliency_maps.text_prompts import *
@@ -40,7 +41,7 @@ def get_transforms(split='train'):
         
     if split == 'train':
         return A.Compose([
-            A.Resize(224, 224),
+            A.Resize(512, 512),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.Rotate(limit=30, p=0.5),
@@ -53,7 +54,7 @@ def get_transforms(split='train'):
         ])
     else:
         return A.Compose([
-            A.Resize(224, 224),
+            A.Resize(512, 512),
             A.Normalize(mean=(0.48145466, 0.4578275, 0.40821073), std=(0.26862954, 0.26130258, 0.27577711)),
             ToTensorV2()
         ])
@@ -117,23 +118,53 @@ class FreqMedCLIPDataset(Dataset):
             mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.float32)
 
         # Resize to ensure consistent dimensions before augmentation
-        target_size = 224
+        target_size = 512
         if image.shape[0] != target_size or image.shape[1] != target_size:
             image = cv2.resize(image, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
         if mask.shape[0] != target_size or mask.shape[1] != target_size:
             mask = cv2.resize(mask, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
 
-        # Apply Transforms
+        
+        # Prepare Raw Image [0, 1] for Frequency Branch
+        # We need to apply spatial transforms but NOT normalization
+        # Albumentations doesn't support returning multiple "images" easily with different pipelines
+        # So we manually Inverse Normalize or (Cleaner) Re-apply spatial only.
+        # Efficient hack: We use the already augmented 'image'(0-255 RGB) if ALBUMENTATIONS_AVAILABLE
+        
         if self.transforms:
             augmented = self.transforms(image=image, mask=mask)
-            pixel_values = augmented['image']
+            pixel_values = augmented['image'] # Normalized Tensor
             mask_tensor = augmented['mask'].long()
+            
+            # To get raw image with same spatial transforms:
+            # We can use ReplayCompose or just rely on 'additional_targets' if we refactored get_transforms.
+            # But here, let's just do a simplified approach:
+            # The 'augmented' dict doesn't contain the intermediate un-normalized image.
+            # We can inverse normalize 'pixel_values'.
+            
+            # Mean/Std from get_transforms
+            mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1)
+            std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1)
+            
+            image_raw = pixel_values * std + mean
+            image_raw = torch.clamp(image_raw, 0, 1)
+            # image_raw is (C, H, W). We need (H, W, C) for consistency with below or just keep checks.
+            image_raw = image_raw.permute(1, 2, 0) # Back to HWC for consistency logic below
+            
         else:
             # Fallback to processor if albumentations missing
             inputs = self.processor(images=image, return_tensors="pt")
             pixel_values = inputs['pixel_values'].squeeze(0)
-            mask_resized = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
+            mask_resized = cv2.resize(mask, (512, 512), interpolation=cv2.INTER_NEAREST)
             mask_tensor = torch.from_numpy(mask_resized).long()
+            
+            # Raw image resized
+            image_resized = cv2.resize(image, (512, 512))
+            image_raw = torch.from_numpy(image_resized.astype(np.float32) / 255.0)
+
+        # Ensure image_raw is correct shape/type for return
+        # Logic above ensures image_raw is HWC, [0,1]
+
         
         # Randomly select a text prompt
         text_prompt = random.choice(self.prompts)
@@ -142,6 +173,7 @@ class FreqMedCLIPDataset(Dataset):
         
         return {
             'pixel_values': pixel_values,
+            'image_raw': image_raw.permute(2, 0, 1), # (C, H, W) in [0, 1]
             'input_ids': input_ids,
             'mask': mask_tensor,
             'img_name': img_name
@@ -154,6 +186,10 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         self.biomedclip = biomedclip_model
         self.freq_encoder = freq_encoder
         self.fpn_adapter = fpn_adapter
+        
+        # --- Mandatory Text Projector (512 -> 768) ---
+        # Config says hidden=768, proj=512. BiomedCLIP outputs 512.
+        self.text_projector = nn.Linear(512, 768)
         
         # --- Freeze BiomedCLIP ---
         for param in self.biomedclip.parameters():
@@ -168,7 +204,10 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         
         # --- Dual-Branch Architecture (FMISeg-original) ---
         
-        self.spatial_dim = [14, 28, 56, 112] # Adapted for ViT-B/16 (14x14 start)
+        
+        # self.spatial_dim = [14, 28, 56, 112] # OLD (224x224)
+        # NEW (512x512): 512/16 = 32. Pyramid: [32, 64, 128, 256]
+        self.spatial_dim = [32, 64, 128, 256] 
         feature_dim = [768, 384, 192, 96]
         
         # Branch 1: Main (ViT)
@@ -187,18 +226,15 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         
         # FFBI (Bidirectional Interaction)
         self.ffbi = FFBI(feature_dim[0], 4, True)
+
+        # Fusion Conv for High-Res Skip (96+96 -> 96)
+        self.fusion_conv = nn.Conv2d(feature_dim[3] * 2, feature_dim[3], kernel_size=1)
         
     def get_high_freq_image(self, pixel_values):
-        # Use Laplacian Filter to extract edges (High Frequency)
-        kernel = torch.tensor([[-1, -1, -1], 
-                               [-1,  8, -1], 
-                               [-1, -1, -1]], dtype=torch.float32, device=pixel_values.device)
-        kernel = kernel.view(1, 1, 3, 3).repeat(3, 1, 1, 1)
-        high_freq = F.conv2d(pixel_values, kernel, padding=1, groups=3)
-        
-        return high_freq
+        # Use Haar Wavelet Transform (DWT) -> returns (B, 12, 112, 112)
+        return haar_dwt(pixel_values)
 
-    def forward(self, pixel_values, input_ids):
+    def forward(self, pixel_values, input_ids, image_raw):
         # 1. Image Encoder (ViT) - Branch 1
         vision_outputs = self.biomedclip.vision_model(pixel_values, output_hidden_states=True)
         hidden_states = vision_outputs.hidden_states
@@ -218,9 +254,14 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         image_features = fpn_feats # [s1, s2, s3, s4]
         
         # 2. Frequency Encoder - Branch 2
-        img_h = self.get_high_freq_image(pixel_values)
+        # Use Raw Image for DWT (Crucial fix)
+        img_h = self.get_high_freq_image(image_raw) # image_raw is [0,1] tensor
+        
         text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
-        text_embeds = text_outputs[0] # (B, L, D)
+        text_embeds = text_outputs[0] # (B, L, 512) typically for BiomedCLIP-PubmedBERT
+        
+        # Apply Text Projection
+        text_embeds = self.text_projector(text_embeds) # (B, L, 768)
         
         # FrequencyEncoder returns [f3(14), f2(28), f1(56)]
         # We assume FrequencyEncoder is updated to return 4 scales if we want full match, 
@@ -231,15 +272,77 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # We need s4(112, 96) equivalent.
         # We can just use f1 upsampled? Or just None?
         # Decoder expects a skip.
-        # Let's fake the 4th scale by upsampling f1.
+        # ConvNeXtTiny12Ch returns [s4(768), s3(384), s2(192), s1(96)]
+        # We need to map these to Decoder expectations.
+        # Decoder expects: [s1, s2, s3, s4] where s1 is Bottleneck? 
+        # Wait, in Init:
+        # self.spatial_dim = [14, 28, 56, 112] (For 224 input)
+        # With 512 input:
+        # ViT-B/16: 512/16 = 32. So bottleneck is 32x32.
+        # FPNAdapter output matches ViT stages.
         
-        freq_feats = self.freq_encoder(img_h, text_embeds=text_embeds)
-        # freq_feats: [f3, f2, f1, f0]
+        # For Frequency Branch:
+        # s4: 16x16 (768), s3: 32x32 (384), s2: 64x64 (192), s1: 128x128 (96)
         
-        # Use f0 directly (112x112, 96 channels)
-        f0 = freq_feats[3]
+        # Image Features 2 should correspond to:
+        # [Bottleneck, Skip1, Skip2, HighResSkip]
+        # Bottleneck = s4 (16x16) or s3 (32x32) to match ViT(32x32)?
+        # ViT bottleneck is 32x32. So we should use s3?
+        # But ConvNeXt is strong.
+        # Let's align with ViT stages.
+        # ViT features from FPNAdapter are [s1, s2, s3, s4] in original code (14, 28, 56, 112).
+        # Actually FPNAdapter in original code returns [s1(14), s2(28), s3(56), s4(112)].
+        # Here with 512 input, ViT features will be [32, 64, 128, 256] ? No.
+        # Layer 12 -> 32x32.
+        # So FPNAdapter will output [32, 64, 128, 256].
         
-        image_features2 = [freq_feats[0], freq_feats[1], freq_feats[2], f0]
+        # ConvNeXt returns features: [s4(768, 16x16), s3(384, 32x32), s2(192, 64x64), s1(96, 128x128)]
+        # Note: Resolutions above assume 512x512 input. 
+        # Since DWT halves input to 256x256, actual ConvNeXt feature sizes are:
+        # s4(8x8), s3(16x16), s2(32x32), s1(64x64)
+        
+        
+        # --- Semantic Alignment & Coarse Map ---
+        
+        # 1. Unpack Frequency Features
+        # With Dilated Convolutions (Stride 1 in Stages 2 & 3):
+        # DWT(256) -> s1(64) -> s2(32) -> s3(32) -> s4(32)
+        freq_feats = self.freq_encoder(img_h) 
+        s4, s3, s2, s1 = freq_feats # [768, 384, 192, 96]
+        
+        # 2. Coarse Map Calculation (M2IB-style Text Guidance)
+        # This re-injects semantic awareness into the frequency branch as requested.
+        # Dot product of ViT Bottleneck (image_features[0]) and Text CLS token.
+        
+        vit_bottleneck = image_features[0] # (B, 768, 32, 32)
+        text_cls = text_embeds[:, 0, :]   # (B, 768) - Already projected to 768
+        
+        # (B, 768, 32, 32) * (B, 768, 1, 1) -> Sum(dim=1) -> (B, 1, 32, 32)
+        # This map highlights where the text thinks the object is.
+        coarse_map = (vit_bottleneck * text_cls.unsqueeze(-1).unsqueeze(-1)).sum(dim=1, keepdim=True)
+        coarse_map = torch.sigmoid(coarse_map) # Gate [0, 1]
+        
+        # 3. Gate the High-Level Frequency Features
+        # "Only look at edges where the ViT sees a tumor"
+        s4 = s4 * coarse_map 
+        
+        # 4. Alignment & Pyramid Construction
+        # Target: [Bottleneck(32x32), Skip1(64x64), Skip2(128x128), HighRes(256x256)]
+        
+        # s4 (32x32) -> Matches Bottleneck (32x32). No upsample needed!
+        bn = s4 
+        
+        # s3 (32x32) -> Needs 64x64. Upsample 2x.
+        sk1 = F.interpolate(s3, scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # s2 (32x32) -> Needs 128x128. Upsample 4x.
+        sk2 = F.interpolate(s2, scale_factor=4, mode='bilinear', align_corners=False)
+        
+        # s1 (64x64) -> Needs 256x256. Upsample 4x.
+        f0  = F.interpolate(s1, scale_factor=4, mode='bilinear', align_corners=False)
+        
+        image_features2 = [bn, sk1, sk2, f0] 
+        # --- ALIGNMENT END ---
         
         # 3. Bottleneck Interaction (FFBI)
         # My Bottleneck is index 0 (768, 14x14).
@@ -275,18 +378,22 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Inject f0 (112x112) from Frequency Branch (image_features2[3]) into ViT Branch
         # image_features2[3] is f0, which has shape (B, 96, 112, 112)
         
-        cnn_high_res_skip = image_features2[3] # f0
+        # Fusion Strategy: Fuse ViT (s4) and Freq (f0)
+        vit_s4 = image_features[3]   # (B, 96, 112, 112) - now valid
+        freq_f0 = image_features2[3] # (B, 96, 112, 112)
         
-        # Flatten for Decoder: (B, 112*112, 96)
-        cnn_high_res_skip_flat = rearrange(cnn_high_res_skip, 'b c h w -> b (h w) c')
+        fused_skip = torch.cat([vit_s4, freq_f0], dim=1)
+        fused_skip = self.fusion_conv(fused_skip)
+        
+        cnn_high_res_skip_flat = rearrange(fused_skip, 'b c h w -> b (h w) c')
         os4, _ = self.decoder4(os8, cnn_high_res_skip_flat, text_embeds)
         os4_2, _ = self.decoder4_2(os8_2, skips2[3], text_embeds)
         
         # Reshape for SubpixelUpsample (expects B, C, H, W)
         # Decoder returns (B, HW, C).
-        # Last spatial size was 112.
-        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=112, W=112)
-        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=112, W=112)
+        # Last spatial size was 256 (spatial_dim[3]).
+        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=256, W=256)
+        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=256, W=256)
         
         # Decoder 1 (112->224)
         os1 = self.decoder1(os4)
@@ -350,8 +457,8 @@ def main():
     print("Initializing Fusion Components...")
     fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
     
-    # Frequency Encoder (Modified for 3 channels, 4 scales)
-    freq_encoder = FrequencyEncoder(in_channels=3, base_channels=96, text_dim=768).to(device)
+    # Frequency Encoder (New ConvNeXt)
+    freq_encoder = ConvNeXtTiny12Ch(pretrained=True).to(device) # No more in_channels/base args needed meant for custom
     
     # Model Wrapper
     model = FrequencyMedCLIPSAMv2(biomedclip, freq_encoder, fpn_adapter, args).to(device)
@@ -429,11 +536,12 @@ def main():
         
         for batch_idx, batch in enumerate(pbar):
             pixel_values = batch['pixel_values'].to(device)
+            image_raw = batch['image_raw'].to(device) # New input
             input_ids = batch['input_ids'].to(device)
             masks = batch['mask'].to(device).float()
             
             # Forward
-            preds1, preds2, img_feats, text_feats = model(pixel_values, input_ids) 
+            preds1, preds2, img_feats, text_feats = model(pixel_values, input_ids, image_raw) 
             preds1 = preds1.squeeze(1)
             preds2 = preds2.squeeze(1)
             
@@ -447,7 +555,8 @@ def main():
             loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
             
             # Total Loss
-            loss = (loss_dice1 + loss_bce1) + 0.5 * (loss_dice2 + loss_bce2) + 0.1 * loss_hnl
+            # Total Loss (0.2 weight for frequency branch as per critique)
+            loss = (loss_dice1 + loss_bce1) + 0.2 * (loss_dice2 + loss_bce2) + 0.1 * loss_hnl
             
             loss = loss / args.grad_accum_steps
             loss.backward()
@@ -473,10 +582,11 @@ def main():
         with torch.no_grad():
             for batch in val_loader:
                 pixel_values = batch['pixel_values'].to(device)
+                image_raw = batch['image_raw'].to(device)
                 input_ids = batch['input_ids'].to(device)
                 masks = batch['mask'].to(device).float()
                 
-                preds1, preds2, _, _ = model(pixel_values, input_ids)
+                preds1, preds2, _, _ = model(pixel_values, input_ids, image_raw)
                 # Use Main Branch (preds1) for metrics, or average?
                 # FMISeg likely uses main branch.
                 preds = preds1.squeeze(1)
