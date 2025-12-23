@@ -27,7 +27,7 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import our custom components
-from freqmedclip.scripts.freq_components import FrequencyEncoder, FPNAdapter
+from freqmedclip.scripts.freq_components import FrequencyEncoder, FPNAdapter, haar_dwt
 from freqmedclip.scripts.fmiseg_components import FFBI, Decoder, SubpixelUpsample, UnetOutBlock
 from scripts.methods import vision_heatmap_iba
 from saliency_maps.text_prompts import *
@@ -187,16 +187,13 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         
         # FFBI (Bidirectional Interaction)
         self.ffbi = FFBI(feature_dim[0], 4, True)
+
+        # Fusion Conv for High-Res Skip (96+96 -> 96)
+        self.fusion_conv = nn.Conv2d(feature_dim[3] * 2, feature_dim[3], kernel_size=1)
         
     def get_high_freq_image(self, pixel_values):
-        # Use Laplacian Filter to extract edges (High Frequency)
-        kernel = torch.tensor([[-1, -1, -1], 
-                               [-1,  8, -1], 
-                               [-1, -1, -1]], dtype=torch.float32, device=pixel_values.device)
-        kernel = kernel.view(1, 1, 3, 3).repeat(3, 1, 1, 1)
-        high_freq = F.conv2d(pixel_values, kernel, padding=1, groups=3)
-        
-        return high_freq
+        # Use Haar Wavelet Transform (DWT) -> returns (B, 12, 112, 112)
+        return haar_dwt(pixel_values)
 
     def forward(self, pixel_values, input_ids):
         # 1. Image Encoder (ViT) - Branch 1
@@ -275,10 +272,14 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Inject f0 (112x112) from Frequency Branch (image_features2[3]) into ViT Branch
         # image_features2[3] is f0, which has shape (B, 96, 112, 112)
         
-        cnn_high_res_skip = image_features2[3] # f0
+        # Fusion Strategy: Fuse ViT (s4) and Freq (f0)
+        vit_s4 = image_features[3]   # (B, 96, 112, 112) - now valid
+        freq_f0 = image_features2[3] # (B, 96, 112, 112)
         
-        # Flatten for Decoder: (B, 112*112, 96)
-        cnn_high_res_skip_flat = rearrange(cnn_high_res_skip, 'b c h w -> b (h w) c')
+        fused_skip = torch.cat([vit_s4, freq_f0], dim=1)
+        fused_skip = self.fusion_conv(fused_skip)
+        
+        cnn_high_res_skip_flat = rearrange(fused_skip, 'b c h w -> b (h w) c')
         os4, _ = self.decoder4(os8, cnn_high_res_skip_flat, text_embeds)
         os4_2, _ = self.decoder4_2(os8_2, skips2[3], text_embeds)
         
@@ -350,8 +351,8 @@ def main():
     print("Initializing Fusion Components...")
     fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
     
-    # Frequency Encoder (Modified for 3 channels, 4 scales)
-    freq_encoder = FrequencyEncoder(in_channels=3, base_channels=96, text_dim=768).to(device)
+    # Frequency Encoder (Modified for 12 channels DWT)
+    freq_encoder = FrequencyEncoder(in_channels=12, base_channels=96, text_dim=768).to(device)
     
     # Model Wrapper
     model = FrequencyMedCLIPSAMv2(biomedclip, freq_encoder, fpn_adapter, args).to(device)
@@ -447,7 +448,8 @@ def main():
             loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
             
             # Total Loss
-            loss = (loss_dice1 + loss_bce1) + 0.5 * (loss_dice2 + loss_bce2) + 0.1 * loss_hnl
+            # Total Loss (0.2 weight for frequency branch as per critique)
+            loss = (loss_dice1 + loss_bce1) + 0.2 * (loss_dice2 + loss_bce2) + 0.1 * loss_hnl
             
             loss = loss / args.grad_accum_steps
             loss.backward()
