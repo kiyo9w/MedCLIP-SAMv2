@@ -2,7 +2,7 @@ Dataset: brain_tumors
 Checkpoint: ..\checkpoints\results_resume_20251205_100810\brain_tumors_checkpoints_resume\fusion_brain_tumors_epoch145.pth
 Test samples: 600
 
-Dice Score:  0.8443 ± 0.1558
-IoU:         0.7547 ± 0.1837
-Precision:   0.8866 ± 0.1544
-Recall:      0.8370 ± 0.1879
+Dice Score:  0.8446 ± 0.1550
+IoU:         0.7550 ± 0.1833
+Precision:   0.8867 ± 0.1536
+Recall:      0.8373 ± 0.1874

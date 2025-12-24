@@ -1,0 +1,45 @@
+# Frequency-Aware MedCLIP-SAMv2 Training Configuration
+
+# Dataset paths (relative to workspace root)
+csv_path: "MedCLIP-SAMv2-finetune/data/medpix_dataset/medpix_dataset.csv"
+val_ratio: 0.1
+
+# Model architecture
+image_size: 224
+max_text_len: 64
+embedding_dim: 768
+num_patches: 196
+
+# Frequency-aware modules
+wavelet_type: "haar"
+fusion_ratio: 0.1  # Initial alpha for frequency fusion
+blur_kernel: 5
+morphology_kernel: 5
+frequency_weight: 0.3
+
+# BiomedCLIP tokenizer
+tokenizer_name: "chuhac/BiomedCLIP-vit-bert-hf"
+
+# Training hyperparameters
+batch_size: 8
+num_workers: 0  # Use main process dataloader on Windows to avoid I/O worker path issues
+use_amp: true
+weight_decay: 0.00001
+
+# Stage 1: Warm-up frequency modules (RECOMMENDED - START HERE)
+stage1_lr: 0.0001
+stage1_epochs: 5  # Start with 5 epochs
+
+# Stage 2: Fine-tune vision encoder (OPTIONAL - Use if Stage 1 results are promising)
+stage2_freq_lr: 0.00005
+stage2_vision_lr: 0.00001
+stage2_epochs: 10
+unfreeze_blocks: 2
+
+# Stage 3: Full vision encoder (NOT RECOMMENDED - High risk to zero-sahot)
+stage3_freq_lr: 0.00002
+stage3_vision_lr: 0.000005
+stage3_epochs: 30
+
+# Checkpoint directory (will be created automatically)
+checkpoint_dir: "checkpoints/early_fusion"

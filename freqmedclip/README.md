@@ -1,103 +1,70 @@
-# FreqMedCLIP - Smart Single-Stream Architecture
+# FreqMedCLIP (FMISeg Dual-Branch Version)
 
-Folder chứa code cho FreqMedCLIP (Frequency-domain Medical CLIP) với kiến trúc Smart Single-Stream.
+Kiến trúc mới: BiomedCLIP backbone + FrequencyEncoder + FPNAdapter + dual decoder (ViT branch & Frequency branch) với FFBI/LFFI. Không dùng SmartFusionBlock/SAM.
 
-## Cấu trúc
+## Files chính
+- `train_freq_fusion.py`: Train 1 dataset (dual-branch FMISeg-style).
+- `batch_train_and_eval.py`: Train tuần tự brain_tumors + breast_tumors, auto-eval, sinh summary.
+- `resume_training.py`: Tiếp tục train thêm 100 epochs từ checkpoint đã có.
+- `evaluate_freqmedclip.py`: Evaluate test/val + visualize intermediate (freq features, FPN scales, 2 branches, overlay).
+- `postprocess_freqmedclip_outputs.py`: Hậu xử lý mask (kmeans/threshold, top-k components).
+- `scripts/freq_components.py`, `scripts/fmiseg_components.py`, `scripts/postprocess.py`: Core modules.
+- `old/`: Toàn bộ script pipeline/SmartFusionBlock cũ (không còn dùng, giữ tham khảo).
 
-```
-freqmedclip/
-├── scripts/
-│   ├── freq_components.py      # DWT + SmartFusionBlock
-│   └── postprocess.py          # KMeans + Threshold postprocessing
-│
-├── train_freq_fusion.py        # Main training script
-├── evaluate_model.py            # Evaluation + auto-visualization
-├── save_freqmedclip_predictions.py   # Batch prediction
-├── postprocess_freqmedclip_outputs.py # Batch postprocessing
-├── visualize_prediction.py     # 3x3 grid visualization
-│
-├── train_both_clean.bat         # ⭐ RECOMMENDED: Train 2 datasets (best epoch only)
-├── train_both_datasets.bat      # Old: Train all epochs
-├── train_and_eval.bat           # Train + evaluate
-└── run_freqmedclip_pipeline.ps1 # Complete pipeline
-```
-
-## Quick Start
-
-### 1. Training (Chỉ lưu best epoch - Recommended)
-
-```bash
-cd freqmedclip
-.\train_both_clean.bat
-```
-
-Sẽ train:
-- breast_tumors (100 epochs)
-- brain_tumors (100 epochs)
-- Chỉ lưu checkpoint tốt nhất (tiết kiệm ~98% dung lượng)
-- In Dice + IoU mỗi epoch
-- Tự động evaluate + visualize sau khi train xong
-
-### 2. Training từng dataset
-
-```bash
-cd freqmedclip
-python train_freq_fusion.py --dataset breast_tumors --epochs 100 --batch-size 4 --lr 0.0001
-```
-
-### 3. Evaluation + Visualization
-
-```bash
-python evaluate_model.py --dataset breast_tumors --checkpoint ../checkpoints/fusion_breast_tumors_epoch50.pth
-```
-
-Output:
-- `results_breast_tumors_epoch50.txt` - Metrics (Dice, IoU, Precision, Recall)
-- `visualizations/breast_tumors_eval/` - Overlay images (GT vs Pred)
-
-### 4. Complete Pipeline (Generate → Postprocess → Visualize)
+## Quick start
 
 ```powershell
-.\run_freqmedclip_pipeline.ps1 -Dataset breast_tumors -Checkpoint ../checkpoints/fusion_breast_tumors_epoch100.pth
+cd freqmedclip
+conda activate medclipsamv2  # hoặc chạy ../activate_conda_medclipsamv2.ps1
+
+# Train 1 dataset
+python train_freq_fusion.py --dataset breast_tumors --epochs 100 --batch-size 4 --lr 1e-4
+
+# Evaluate
+python evaluate_freqmedclip.py --dataset breast_tumors --checkpoint ..\checkpoints\results_*/breast_tumors_checkpoints/*.pth
 ```
 
-## File Details
-
-### Core Components
-- **freq_components.py**: 
-  - `DWTForward` - Discrete Wavelet Transform (Haar filters)
-  - `SmartFusionBlock` - Coarse-to-Fine fusion với multi-scale gates
-
-### Training
-- **train_freq_fusion.py**: Main training với validation metrics
-  - Automatically saves best checkpoint only
-  - Prints Dice + IoU every epoch
-
-### Evaluation
-- **evaluate_model.py**: 
-  - Calculate Dice, IoU, Precision, Recall
-  - Auto-generate visualizations (every 10 samples)
-
-### Postprocessing
-- **postprocess.py**:
-  - `postprocess_saliency_kmeans()` - KMeans clustering (default)
-  - `postprocess_saliency_threshold()` - Simple threshold
-
-## Import từ ngoài folder
-
-Nếu cần import FreqMedCLIP từ root project:
-
-```python
-from freqmedclip.scripts.freq_components import SmartFusionBlock, DWTForward
-from freqmedclip.train_freq_fusion import FreqMedCLIPDataset
+## Train hai dataset + auto eval
+```powershell
+cd freqmedclip
+python batch_train_and_eval.py
+# Kết quả + visualizations + summary trong results_{timestamp}/
 ```
 
-## Dependencies
+## Resume thêm 100 epochs từ checkpoint cũ
+```powershell
+cd freqmedclip
+python resume_training.py
+# Input checkpoints: ..\checkpoints\results_20251205_011222\<dataset>_checkpoints\fusion_...pth
+# Output: ..\checkpoints\results_resume_{timestamp}\
+```
 
-- PyTorch >= 1.13
-- transformers >= 4.30
-- PyWavelets (pywt)
-- OpenCV (cv2)
-- PIL, numpy, tqdm
+## Hậu xử lý mask (dùng cho weak SSL hoặc nộp kết quả)
+```powershell
+python postprocess_freqmedclip_outputs.py --input <pred_dir> --output <clean_dir> --method kmeans --top-k 1
+```
+- Input: raw mask (0-255) từ mô hình.
+- Output: binary mask sạch hơn (top-k largest components).
 
-Xem `../medclipsamv2_env.yml` để setup environment.
+## Chuẩn bị pseudo-labels cho weakly SSL (nnUNet)
+1) Sinh predictions (dùng evaluate_freqmedclip hoặc script riêng) => thư mục raw/cleaned masks.
+2) Chuyển sang định dạng nnUNet (theo `weak_segmentation/nnunetv2/dataset_conversion/our_datasets.py`):
+```
+data/nnUNet_raw/DatasetXXX_Name/
+  imagesTr/ case_0000_0000.png
+  labelsTr/ case_0000.png   # pseudo-label
+  imagesTs/ ...
+  labelsTs/ ... (nếu có)
+```
+3) Chạy:
+```bash
+nnUNetv2_plan_and_preprocess -d DATASET_ID
+nnUNetv2_train DATASET_ID 2d all --npz
+```
+
+## Legacy (không dùng với bản mới)
+- `old/README.md`, `old/run_freqmedclip_pipeline.ps1`, `old/save_freqmedclip_predictions.py`, `old/train_and_eval.bat`, `old/train_both_clean.bat`, `old/train_both_datasets.bat`, `old/visualize_prediction.py`.
+
+## Notes
+- Checkpoints/results đều đã được ignore trong .gitignore; không push lên git.
+- BiomedCLIP tải local từ `../saliency_maps/model`.
