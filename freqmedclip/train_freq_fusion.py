@@ -324,27 +324,24 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         
         # 3. Gate the High-Level Frequency Features
         # "Only look at edges where the ViT sees a tumor"
-        # Ensure spatial alignment between coarse_map and s4 before gating
-        if coarse_map.shape[-2:] != s4.shape[-2:]:
-            coarse_map = F.interpolate(coarse_map, size=s4.shape[-2:], mode='bilinear', align_corners=False)
-        s4 = s4 * coarse_map
-
+        s4 = s4 * coarse_map 
+        
         # 4. Alignment & Pyramid Construction
-        # Instead of assuming hard-coded upsample factors, derive desired
-        # target spatial sizes from the ViT `image_features` so branches align.
-        tgt0 = image_features[0].shape[-2:]  # bottleneck spatial size (H,W)
-        tgt1 = image_features[1].shape[-2:]
-        tgt2 = image_features[2].shape[-2:]
-        tgt3 = image_features[3].shape[-2:]
-
-        # Resize frequency features to match corresponding ViT feature maps
-        s4_resized = F.interpolate(s4, size=tgt0, mode='bilinear', align_corners=False)
-        s3_resized = F.interpolate(s3, size=tgt1, mode='bilinear', align_corners=False)
-        s2_resized = F.interpolate(s2, size=tgt2, mode='bilinear', align_corners=False)
-        s1_resized = F.interpolate(s1, size=tgt3, mode='bilinear', align_corners=False)
-
-        # Build pyramid: [Bottleneck, Skip1, Skip2, HighResSkip]
-        image_features2 = [s4_resized, s3_resized, s2_resized, s1_resized]
+        # Target: [Bottleneck(32x32), Skip1(64x64), Skip2(128x128), HighRes(256x256)]
+        
+        # s4 (32x32) -> Matches Bottleneck (32x32). No upsample needed!
+        bn = s4 
+        
+        # s3 (32x32) -> Needs 64x64. Upsample 2x.
+        sk1 = F.interpolate(s3, scale_factor=2, mode='bilinear', align_corners=False)
+        
+        # s2 (32x32) -> Needs 128x128. Upsample 4x.
+        sk2 = F.interpolate(s2, scale_factor=4, mode='bilinear', align_corners=False)
+        
+        # s1 (64x64) -> Needs 256x256. Upsample 4x.
+        f0  = F.interpolate(s1, scale_factor=4, mode='bilinear', align_corners=False)
+        
+        image_features2 = [bn, sk1, sk2, f0] 
         # --- ALIGNMENT END ---
         
         # 3. Bottleneck Interaction (FFBI)
@@ -393,26 +390,10 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         os4_2, _ = self.decoder4_2(os8_2, skips2[3], text_embeds)
         
         # Reshape for SubpixelUpsample (expects B, C, H, W)
-        # Decoder returns (B, HW, C). Infer spatial dims from token length.
-        def tokens_to_hw(x_tokens, fallback=None):
-            L = x_tokens.shape[1]
-            H = int(L ** 0.5)
-            W = L // H
-            if H * W != L:
-                if fallback is not None:
-                    H, W = fallback
-                    if H * W != L:
-                        raise ValueError(f"Cannot reshape tokens of length {L} into H*W={H}*{W}.")
-                else:
-                    raise ValueError(f"Cannot infer square spatial dims from tokens length {L}.")
-            return H, W
-
-        # Try to infer using spatial_dim as fallback
-        fallback_hw = (self.spatial_dim[3], self.spatial_dim[3]) if hasattr(self, 'spatial_dim') else None
-        H4, W4 = tokens_to_hw(os4, fallback=fallback_hw)
-        H4_2, W4_2 = tokens_to_hw(os4_2, fallback=fallback_hw)
-        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=H4, W=W4)
-        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=H4_2, W=W4_2)
+        # Decoder returns (B, HW, C).
+        # Last spatial size was 256 (spatial_dim[3]).
+        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=256, W=256)
+        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=256, W=256)
         
         # Decoder 1 (112->224)
         os1 = self.decoder1(os4)
@@ -423,15 +404,9 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         out_2 = self.out_2(os1_2)
         
         # Prepare features for HNL (Contrastive Loss)
-        # Pool bottleneck features: infer spatial dims from token length of fu32_flat
-        L_fu = fu32_flat.shape[1]
-        h_fu = int(L_fu ** 0.5)
-        w_fu = L_fu // h_fu
-        if h_fu * w_fu != L_fu:
-            # Fallback: try to derive from image_features[0]
-            bf = image_features[0]
-            h_fu, w_fu = bf.shape[-2], bf.shape[-1]
-        fu32 = rearrange(fu32_flat, 'b (h w) c -> b c h w', h=h_fu, w=w_fu)
+        # Pool bottleneck features: (B, C, 14, 14) -> (B, C)
+        # Use fused features
+        fu32 = rearrange(fu32_flat, 'b (h w) c -> b c h w', h=14, w=14)
         img_feats_pooled = F.adaptive_avg_pool2d(fu32, (1, 1)).squeeze(-1).squeeze(-1)
         text_feats_pooled = text_embeds[:, 0, :] # Use [CLS] token
         

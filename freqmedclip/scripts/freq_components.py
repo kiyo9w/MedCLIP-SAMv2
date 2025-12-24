@@ -42,47 +42,6 @@ def haar_dwt(x):
     out = torch.cat([LL, LH, HL, HH], dim=1)
     return out
 
-
-class DWTForward(nn.Module):
-    """Simple module wrapper around `haar_dwt` to match expected API."""
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return haar_dwt(x)
-
-
-class IDWTInverse(nn.Module):
-    """Inverse of the simple Haar DWT implemented above.
-    Expects input shape (B, 4*C, H, W) and returns (B, C, H*2, W*2).
-    This provides a lightweight inverse used for visualization and evaluation.
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        # x: (B, 4*C, H, W)
-        B, C4, H, W = x.shape
-        if C4 % 4 != 0:
-            raise ValueError('Expected channel dim divisible by 4 for IDWTInverse')
-        C = C4 // 4
-        LL, LH, HL, HH = torch.split(x, C, dim=1)
-
-        # Inverse Haar formulas to recover four pixel values
-        x00 = LL + LH + HL + HH
-        x01 = LL - LH + HL - HH
-        x10 = LL + LH - HL - HH
-        x11 = LL - LH - HL + HH
-
-        # Reconstruct spatial grid
-        out = x00.new_zeros((B, C, H * 2, W * 2))
-        out[:, :, 0::2, 0::2] = x00
-        out[:, :, 0::2, 1::2] = x01
-        out[:, :, 1::2, 0::2] = x10
-        out[:, :, 1::2, 1::2] = x11
-
-        return out
-
 # --- 1. LFFI Components (FMISeg Original Logic) ---
 
 class PositionalEncoding(nn.Module):
