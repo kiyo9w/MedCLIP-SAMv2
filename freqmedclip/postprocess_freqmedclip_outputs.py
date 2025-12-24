@@ -6,10 +6,13 @@ Usage:
     python postprocess_freqmedclip_outputs.py --input predictions/breast_tumors --output predictions_cleaned/breast_tumors
 """
 import os
+import sys
 import argparse
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from freqmedclip.scripts.postprocess import postprocess_saliency_kmeans, postprocess_saliency_threshold
 
 

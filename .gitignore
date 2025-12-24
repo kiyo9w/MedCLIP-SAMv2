@@ -4,6 +4,7 @@ coarse_outputs/
 sam_outputs/
 saliency_map_outputs/
 visualizations/
+.venv/
 
 # Checkpoints and models
 checkpoints/
@@ -16,6 +17,7 @@ segment-anything/sam_checkpoints/
 biomedclip_finetuning/open_clip/src/data/
 results_*/
 freqmedclip/results_*/
+freqmedclip/fusion_brain_tumors_epoch145.pth
 
 # External repositories
 FMISeg/

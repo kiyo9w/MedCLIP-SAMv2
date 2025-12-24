@@ -154,8 +154,24 @@ class Decoder(nn.Module):
     def forward(self, vis, skip_vis, txt):
         if txt is not None:
             vis, txt =  self.lffi_layer(vis, txt)
-        vis = rearrange(vis,'B (H W) C -> B C H W',H=self.spatial_size,W=self.spatial_size)
-        skip_vis = rearrange(skip_vis,'B (H W) C -> B C H W',H=self.spatial_size*2,W=self.spatial_size*2)
+        # Infer spatial dimensions from token length to avoid mismatches
+        B, L, C = vis.shape
+        H = int(L ** 0.5)
+        W = H
+        if H * W != L:
+            raise ValueError(f"Cannot reshape tokens of length {L} into square spatial map (H*W).")
+        vis = rearrange(vis, 'B (H W) C -> B C H W', H=H, W=W)
+        # skip_vis expected to be 2x spatial resolution
+        skip_L = skip_vis.shape[1]
+        skip_H = H * 2
+        skip_W = skip_H
+        if skip_H * skip_W != skip_L:
+            # Fallback: try to infer skip spatial size directly
+            skip_H = int(skip_L ** 0.5)
+            skip_W = skip_H
+            if skip_H * skip_W != skip_L:
+                raise ValueError(f"Cannot reshape skip tokens of length {skip_L} into square spatial map (H*W).")
+        skip_vis = rearrange(skip_vis, 'B (H W) C -> B C H W', H=skip_H, W=skip_W)
         output = self.decoder(vis,skip_vis)
         output = rearrange(output,'B C H W -> B (H W) C')
         return output, txt

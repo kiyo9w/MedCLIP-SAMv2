@@ -5,61 +5,83 @@ import math
 
 # --- 0. DWT/IDWT Components ---
 
+def haar_dwt(x):
+    """
+    Perform Haar Wavelet Transform on a batch of images.
+    x: (B, C, H, W)
+    Returns: (B, 4*C, H/2, W/2) -> Stacked [LL, LH, HL, HH]
+    """
+    B, C, H, W = x.shape
+    # Ensure dimensions are even
+    if H % 2 != 0 or W % 2 != 0:
+        x = F.pad(x, (0, W % 2, 0, H % 2), mode='reflect')
+        B, C, H, W = x.shape
+        
+    x = x.view(B, C, H // 2, 2, W // 2, 2)
+    
+    # 4 Sub-bands
+    # x: (B, C, H/2, 2, W/2, 2)
+    # Slice for vectorization
+    x00 = x[:, :, :, 0, :, 0] # Top-Left
+    x01 = x[:, :, :, 0, :, 1] # Top-Right
+    x10 = x[:, :, :, 1, :, 0] # Bottom-Left
+    x11 = x[:, :, :, 1, :, 1] # Bottom-Right
+    
+    # Haar Formulas (Normalized averages)
+    # LL: Low Frequency (Approximation)
+    LL = (x00 + x01 + x10 + x11) / 4.0
+    # LH: Vertical Detail
+    LH = (x00 - x01 + x10 - x11) / 4.0 
+    # HL: Horizontal Detail
+    HL = (x00 + x01 - x10 - x11) / 4.0 
+    # HH: Diagonal Detail
+    HH = (x00 - x01 - x10 + x11) / 4.0 
+    
+    # Stack channels: (B, 4C, H/2, W/2)
+    # Order: LL, LH, HL, HH
+    out = torch.cat([LL, LH, HL, HH], dim=1)
+    return out
+
+
 class DWTForward(nn.Module):
-    """Discrete Wavelet Transform using Haar filters"""
+    """Simple module wrapper around `haar_dwt` to match expected API."""
     def __init__(self):
-        super(DWTForward, self).__init__()
-        
+        super().__init__()
+
     def forward(self, x):
-        """
-        Apply 2D DWT to input using Haar filters.
-        Input: [B, C, H, W]
-        Output: LH, HL, HH (high-frequency components)
-        """
-        # Haar filters
-        # LL = [[1, 1], [1, 1]] / 2
-        # LH = [[1, -1], [1, -1]] / 2
-        # HL = [[1, 1], [-1, -1]] / 2
-        # HH = [[1, -1], [-1, 1]] / 2
-        
-        # Downsample: average adjacent pixels
-        LL = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] + 
-              x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 4
-        
-        LH = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] + 
-              x[:, :, 1::2, 0::2] - x[:, :, 1::2, 1::2]) / 4
-        
-        HL = (x[:, :, 0::2, 0::2] + x[:, :, 0::2, 1::2] - 
-              x[:, :, 1::2, 0::2] - x[:, :, 1::2, 1::2]) / 4
-        
-        HH = (x[:, :, 0::2, 0::2] - x[:, :, 0::2, 1::2] - 
-              x[:, :, 1::2, 0::2] + x[:, :, 1::2, 1::2]) / 4
-        
-        return LH, HL, HH
+        return haar_dwt(x)
+
 
 class IDWTInverse(nn.Module):
-    """Inverse Discrete Wavelet Transform"""
+    """Inverse of the simple Haar DWT implemented above.
+    Expects input shape (B, 4*C, H, W) and returns (B, C, H*2, W*2).
+    This provides a lightweight inverse used for visualization and evaluation.
+    """
     def __init__(self):
-        super(IDWTInverse, self).__init__()
-        
-    def forward(self, LL, LH, HL, HH):
-        """
-        Reconstruct image from wavelet coefficients.
-        Input: LL, LH, HL, HH each of shape [B, C, H, W]
-        Output: [B, C, 2H, 2W]
-        """
-        B, C, H, W = LL.shape
-        
-        # Reconstruct by interleaving coefficients
-        x = torch.zeros(B, C, 2*H, 2*W, device=LL.device, dtype=LL.dtype)
-        
-        x[:, :, 0::2, 0::2] = LL + LH + HL + HH
-        x[:, :, 0::2, 1::2] = LL - LH + HL - HH
-        x[:, :, 1::2, 0::2] = LL + LH - HL - HH
-        x[:, :, 1::2, 1::2] = LL - LH - HL + HH
-        
-        return x
+        super().__init__()
 
+    def forward(self, x):
+        # x: (B, 4*C, H, W)
+        B, C4, H, W = x.shape
+        if C4 % 4 != 0:
+            raise ValueError('Expected channel dim divisible by 4 for IDWTInverse')
+        C = C4 // 4
+        LL, LH, HL, HH = torch.split(x, C, dim=1)
+
+        # Inverse Haar formulas to recover four pixel values
+        x00 = LL + LH + HL + HH
+        x01 = LL - LH + HL - HH
+        x10 = LL + LH - HL - HH
+        x11 = LL - LH - HL + HH
+
+        # Reconstruct spatial grid
+        out = x00.new_zeros((B, C, H * 2, W * 2))
+        out[:, :, 0::2, 0::2] = x00
+        out[:, :, 0::2, 1::2] = x01
+        out[:, :, 1::2, 0::2] = x10
+        out[:, :, 1::2, 1::2] = x11
+
+        return out
 
 # --- 1. LFFI Components (FMISeg Original Logic) ---
 
@@ -128,8 +150,6 @@ class CrossAttentionLFFI(nn.Module):
         self.cross_attn2 = nn.MultiheadAttention(embed_dim=in_channels, num_heads=4, batch_first=True)
         
         # Text Projection
-        # Note: input_text_len should match the tokenizer's max_length (77 for CLIP)
-        # FIX: Use Linear instead of Conv1d to avoid mixing tokens across sequence
         self.text_project = nn.Sequential(
             nn.Linear(embed_dim, in_channels), # Project embedding dim
             nn.LayerNorm(in_channels),
@@ -169,7 +189,6 @@ class CrossAttentionLFFI(nn.Module):
         vis_flat = x.flatten(2).transpose(1, 2)
         
         # Project Text: [B, L, D] -> [B, L, C]
-        # FIX: Apply Linear projection to the last dimension (D)
         txt_proj = self.text_project(txt) # [B, L, C]
         
         # Self Augment Visual
@@ -193,10 +212,6 @@ class CrossAttentionLFFI(nn.Module):
         vis2_l = self.norm5(self.fl2(vis2_l) + vis2_l)
         
         # Interaction: vis2_v + Linear(vis2_v @ vis2_l.T)
-        # vis2_v: [B, HW, C]
-        # vis2_l: [B, L, C]
-        # matmul: [B, HW, L]
-        # line: Linear(L, C) -> [B, HW, C]
         interaction = torch.matmul(vis2_v, vis2_l.transpose(1, 2))
         vis2 = vis2_v + self.line(interaction)
         
@@ -215,10 +230,7 @@ class CrossAttentionLFFI(nn.Module):
 class FPNAdapter(nn.Module):
     """
     Adapts the Multi-Scale ViT outputs to a Feature Pyramid.
-    Inputs: [feat_last(14), feat_s3(14), feat_s2(14), feat_s1(14)] -> Actually ViT is isotropic, so all are 14x14
-    But we want to upsample them to form a pyramid.
-    
-    We assume inputs are [feat_layer12, feat_layer9, feat_layer6, feat_layer3] (all 14x14)
+    Inputs: [feat_last(14), feat_s3(14), feat_s2(14), feat_s1(14)] -> All 14x14
     We want outputs:
     s1: 14x14 (from layer 12)
     s2: 28x28 (from layer 9)
@@ -251,7 +263,7 @@ class FPNAdapter(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Scale 4 (112x112) - From Layer 3
+        # Scale 4 (112x112) - RESTORED: Resolution Hallucination Fix
         self.scale4_up = nn.Sequential(
             nn.Upsample(scale_factor=8, mode='bilinear', align_corners=False),
             nn.Conv2d(in_channels, out_channels[3], kernel_size=3, padding=1),
@@ -261,8 +273,6 @@ class FPNAdapter(nn.Module):
 
     def forward(self, features):
         # features: list of [feat_layer12, feat_layer9, feat_layer6, feat_layer3]
-        # All are [B, C, 14, 14]
-        
         x12, x9, x6, x3 = features
         
         s1 = self.scale1_conv(x12) # 14x14
@@ -291,66 +301,65 @@ class TextGuidedSEBlock(nn.Module):
 
     def forward(self, x, text_embeds):
         b, c, _, _ = x.shape
-        # Global Average Pooling
         y = self.avg_pool(x).view(b, c)
         
-        # Incorporate Text Information
-        # text_embeds: (B, SeqLen, D) -> Pool to (B, D)
         if text_embeds.dim() == 3:
-            t = text_embeds.mean(dim=1) # Average pooling over sequence
+            t = text_embeds.mean(dim=1)
         else:
             t = text_embeds
             
-        t_proj = self.text_proj(t) # (B, C)
-        
-        # Combine Visual and Text (Element-wise addition)
+        t_proj = self.text_proj(t)
         y = y + t_proj
-        
-        # Generate Channel Weights
         y = self.fc(y).view(b, c, 1, 1)
-        
-        # Scale
         return x * y
 
 class FrequencyEncoder(nn.Module):
     """
     Parallel Encoder for Frequency Features.
-    Processes raw DWT output (9 channels, 112x112) and returns multi-scale features.
+    Processes DWT output (12 channels: 3 RGB * 4 bands, 112x112) and returns multi-scale features.
     """
-    def __init__(self, in_channels=9, base_channels=64, text_dim=768):
+    def __init__(self, in_channels=12, base_channels=64, text_dim=768):
         super().__init__()
         
-        # Input: (B, 9, 112, 112)
+        # Input: (B, 12, 112, 112) (DWT output)
         
-        # Layer 1: 112 -> 56 (Output Scale 3)
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=2, padding=1),
+        # Layer 0: 112x112 Processing (No downsample)
+        # 12 channels -> 64 channels
+        self.layer0 = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(base_channels),
             nn.ReLU(inplace=True)
         )
-        self.se1 = TextGuidedSEBlock(base_channels, text_dim)
         
-        # Layer 2: 56 -> 28 (Output Scale 2)
-        self.layer2 = nn.Sequential(
+        # Layer 1: 112 -> 56 (Output Scale 3)
+        self.layer1 = nn.Sequential(
             nn.Conv2d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(base_channels*2),
             nn.ReLU(inplace=True)
         )
-        self.se2 = TextGuidedSEBlock(base_channels*2, text_dim)
+        self.se1 = TextGuidedSEBlock(base_channels*2, text_dim)
         
-        # Layer 3: 28 -> 14 (Output Scale 1)
-        self.layer3 = nn.Sequential(
+        # Layer 2: 56 -> 28 (Output Scale 2)
+        self.layer2 = nn.Sequential(
             nn.Conv2d(base_channels*2, base_channels*4, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm2d(base_channels*4),
             nn.ReLU(inplace=True)
         )
-        self.se3 = TextGuidedSEBlock(base_channels*4, text_dim)
+        self.se2 = TextGuidedSEBlock(base_channels*4, text_dim)
         
-        # Projections to match decoder dimensions if needed (optional, handled in fusion)
+        # Layer 3: 28 -> 14 (Output Scale 1)
+        self.layer3 = nn.Sequential(
+            nn.Conv2d(base_channels*4, base_channels*8, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(base_channels*8),
+            nn.ReLU(inplace=True)
+        )
+        self.se3 = TextGuidedSEBlock(base_channels*8, text_dim)
         
     def forward(self, x, text_embeds=None):
-        # x: 112x112
-        f1 = self.layer1(x) # 56x56
+        # x: 112x112 (from DWT)
+        f0 = self.layer0(x) # 112x112
+        
+        f1 = self.layer1(f0) # 56x56
         if text_embeds is not None: f1 = self.se1(f1, text_embeds)
         
         f2 = self.layer2(f1) # 28x28
@@ -359,9 +368,8 @@ class FrequencyEncoder(nn.Module):
         f3 = self.layer3(f2) # 14x14
         if text_embeds is not None: f3 = self.se3(f3, text_embeds)
         
-        # Return features from high res to low res or vice versa?
-        # Let's return [14x14, 28x28, 56x56] to match FPNAdapter order roughly
-        return [f3, f2, f1]
+        # Return [f3(14), f2(28), f1(56), f0(112)]
+        return [f3, f2, f1, f0]
 
 class BottleneckFusion(nn.Module):
     """
@@ -439,64 +447,3 @@ class SmartDecoderBlock(nn.Module):
             x = self.lffi(x, text_embeds)
             
         return x
-
-
-# IDWTInverse Removed
-
-class FrequencyEncoder(nn.Module):
-    """
-    Parallel Encoder for Frequency Features.
-    Processes HF Image (3 channels) and returns multi-scale features.
-    """
-    def __init__(self, in_channels=3, base_channels=64, text_dim=768):
-        super().__init__()
-        
-        # Input: (B, 3, 224, 224) (Raw/Normalized Image)
-        
-        # Layer 1: 224 -> 112
-        self.layer0 = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels),
-            nn.ReLU(inplace=True)
-        )
-        # Layer 2: 112 -> 56 (Output Scale 3)
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels*2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels*2),
-            nn.ReLU(inplace=True)
-        )
-        self.se1 = TextGuidedSEBlock(base_channels*2, text_dim)
-        
-        # Layer 3: 56 -> 28 (Output Scale 2)
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(base_channels*2, base_channels*4, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels*4),
-            nn.ReLU(inplace=True)
-        )
-        self.se2 = TextGuidedSEBlock(base_channels*4, text_dim)
-        
-        # Layer 4: 28 -> 14 (Output Scale 1)
-        self.layer3 = nn.Sequential(
-            nn.Conv2d(base_channels*4, base_channels*8, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels*8),
-            nn.ReLU(inplace=True)
-        )
-        self.se3 = TextGuidedSEBlock(base_channels*8, text_dim)
-        
-    def forward(self, x, text_embeds=None):
-        # x: 224x224
-        f0 = self.layer0(x) # 112x112
-        
-        f1 = self.layer1(f0) # 56x56
-        if text_embeds is not None: f1 = self.se1(f1, text_embeds)
-        
-        f2 = self.layer2(f1) # 28x28
-        if text_embeds is not None: f2 = self.se2(f2, text_embeds)
-        
-        f3 = self.layer3(f2) # 14x14
-        if text_embeds is not None: f3 = self.se3(f3, text_embeds)
-        
-        # Return [14x14, 28x28, 56x56, 112x112]
-        return [f3, f2, f1, f0]
-
-
