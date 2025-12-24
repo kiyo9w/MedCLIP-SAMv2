@@ -236,6 +236,26 @@ class FrequencyMedCLIPSAMv2(nn.Module):
 
     def forward(self, pixel_values, input_ids, image_raw):
         # 1. Image Encoder (ViT) - Branch 1
+        # Ensure input spatial size matches BiomedCLIP's expected image size
+        _, _, H, W = pixel_values.shape
+        expected_size = None
+        vm = self.biomedclip.vision_model
+        if hasattr(vm, 'embeddings') and hasattr(vm.embeddings, 'image_size'):
+            expected_size = vm.embeddings.image_size
+        elif hasattr(self.biomedclip, 'config'):
+            # try common config locations
+            cfg = getattr(self.biomedclip, 'config')
+            if hasattr(cfg, 'vision_config') and getattr(cfg.vision_config, 'image_size', None) is not None:
+                expected_size = cfg.vision_config.image_size
+            elif getattr(cfg, 'image_size', None) is not None:
+                expected_size = cfg.image_size
+
+        if expected_size is None:
+            expected_size = 224
+
+        if H != expected_size or W != expected_size:
+            pixel_values = F.interpolate(pixel_values, size=(expected_size, expected_size), mode='bilinear', align_corners=False)
+
         vision_outputs = self.biomedclip.vision_model(pixel_values, output_hidden_states=True)
         hidden_states = vision_outputs.hidden_states
         
@@ -255,13 +275,27 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         
         # 2. Frequency Encoder - Branch 2
         # Use Raw Image for DWT (Crucial fix)
-        img_h = self.get_high_freq_image(image_raw) # image_raw is [0,1] tensor
+        # Resize raw image to the same spatial size used by the ViT encoder
+        # so that feature pyramids align spatially.
+        image_raw_resized = F.interpolate(image_raw, size=(expected_size, expected_size), mode='bilinear', align_corners=False)
+        img_h = self.get_high_freq_image(image_raw_resized) # image_raw is [0,1] tensor
         
         text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
-        text_embeds = text_outputs[0] # (B, L, 512) typically for BiomedCLIP-PubmedBERT
-        
-        # Apply Text Projection
-        text_embeds = self.text_projector(text_embeds) # (B, L, 768)
+        text_embeds = text_outputs[0]
+
+        # Apply Text Projection if needed. Some BiomedCLIP text backbones already
+        # output 768-d vectors; others output 512-d. Handle both gracefully.
+        if hasattr(self.text_projector, 'in_features') and text_embeds.shape[-1] == self.text_projector.in_features:
+            text_embeds = self.text_projector(text_embeds)
+        elif text_embeds.shape[-1] == getattr(self.text_projector, 'out_features', 768):
+            # already projected to desired dim
+            pass
+        else:
+            # Fallback: create a temporary linear to project to desired dim
+            proj = nn.Linear(text_embeds.shape[-1], getattr(self.text_projector, 'out_features', 768)).to(text_embeds.device)
+            with torch.no_grad():
+                proj.weight.zero_(); proj.bias.zero_()
+            text_embeds = proj(text_embeds)
         
         # FrequencyEncoder returns [f3(14), f2(28), f1(56)]
         # We assume FrequencyEncoder is updated to return 4 scales if we want full match, 
@@ -309,6 +343,13 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # DWT(256) -> s1(64) -> s2(32) -> s3(32) -> s4(32)
         freq_feats = self.freq_encoder(img_h) 
         s4, s3, s2, s1 = freq_feats # [768, 384, 192, 96]
+
+        # Ensure frequency high-level map (`s4`) matches ViT bottleneck spatial size
+        # so gating below broadcasts correctly.
+        vit_bottleneck = image_features[0]
+        _, _, vbH, vbW = vit_bottleneck.shape
+        if s4.shape[2] != vbH or s4.shape[3] != vbW:
+            s4 = F.interpolate(s4, size=(vbH, vbW), mode='bilinear', align_corners=False)
         
         # 2. Coarse Map Calculation (M2IB-style Text Guidance)
         # This re-injects semantic awareness into the frequency branch as requested.
@@ -361,7 +402,16 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Branch 1
         # Prepare skips (flatten)
         skips = [rearrange(item, 'b c h w -> b (h w) c') for item in image_features]
-        skips2 = [rearrange(item, 'b c h w -> b (h w) c') for item in image_features2]
+
+        # Align frequency branch pyramid spatial sizes to ViT branch before flattening
+        aligned_image_features2 = []
+        for ref, feat in zip(image_features, image_features2):
+            _, _, ref_h, ref_w = ref.shape
+            if feat.shape[2] != ref_h or feat.shape[3] != ref_w:
+                feat = F.interpolate(feat, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
+            aligned_image_features2.append(feat)
+
+        skips2 = [rearrange(item, 'b c h w -> b (h w) c') for item in aligned_image_features2]
         
         # Decoder 16 (14->28)
         # Branch 1
@@ -392,8 +442,16 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Reshape for SubpixelUpsample (expects B, C, H, W)
         # Decoder returns (B, HW, C).
         # Last spatial size was 256 (spatial_dim[3]).
-        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=256, W=256)
-        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=256, W=256)
+        # Infer spatial size from token length instead of hardcoding (supports different input sizes)
+        L4 = os4.shape[1]
+        H4 = int(L4 ** 0.5)
+        W4 = H4
+        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=H4, W=W4)
+
+        L4_2 = os4_2.shape[1]
+        H4_2 = int(L4_2 ** 0.5)
+        W4_2 = H4_2
+        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=H4_2, W=W4_2)
         
         # Decoder 1 (112->224)
         os1 = self.decoder1(os4)
@@ -544,13 +602,18 @@ def main():
             preds1, preds2, img_feats, text_feats = model(pixel_values, input_ids, image_raw) 
             preds1 = preds1.squeeze(1)
             preds2 = preds2.squeeze(1)
+            # Resize ground-truth masks to match prediction spatial size
+            if masks.dim() == 3:
+                masks_resized = F.interpolate(masks.unsqueeze(1), size=preds1.shape[-2:], mode='nearest').squeeze(1)
+            else:
+                masks_resized = masks
             
             # Loss (Deep Supervision on both branches)
-            loss_dice1 = dice_criterion(preds1, masks)
-            loss_bce1 = bce_criterion(preds1, masks)
+            loss_dice1 = dice_criterion(preds1, masks_resized)
+            loss_bce1 = bce_criterion(preds1, masks_resized)
             
-            loss_dice2 = dice_criterion(preds2, masks)
-            loss_bce2 = bce_criterion(preds2, masks)
+            loss_dice2 = dice_criterion(preds2, masks_resized)
+            loss_bce2 = bce_criterion(preds2, masks_resized)
             
             loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
             
@@ -587,19 +650,24 @@ def main():
                 masks = batch['mask'].to(device).float()
                 
                 preds1, preds2, _, _ = model(pixel_values, input_ids, image_raw)
-                # Use Main Branch (preds1) for metrics, or average?
-                # FMISeg likely uses main branch.
+                # Use Main Branch (preds1) for metrics
                 preds = preds1.squeeze(1)
-                
+
+                # Resize masks to prediction size
+                if masks.dim() == 3:
+                    masks_resized = F.interpolate(masks.unsqueeze(1), size=preds.shape[-2:], mode='nearest').squeeze(1)
+                else:
+                    masks_resized = masks
+
                 for i in range(preds.shape[0]):
                     pred_binary = (torch.sigmoid(preds[i]) > 0.5).float()
-                    target = masks[i]
-                    
+                    target = masks_resized[i]
+
                     intersection = (pred_binary * target).sum()
                     union = pred_binary.sum() + target.sum()
                     dice = (2. * intersection + 1e-8) / (union + 1e-8)
                     iou = (intersection + 1e-8) / (pred_binary.sum() + target.sum() - intersection + 1e-8)
-                    
+
                     val_dice_scores.append(dice.item())
                     val_iou_scores.append(iou.item())
         

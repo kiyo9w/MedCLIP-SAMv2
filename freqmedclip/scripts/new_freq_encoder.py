@@ -30,37 +30,73 @@ class ConvNeXtTiny12Ch(nn.Module):
             self.model.stages[3].downsample[1].stride = (1, 1) 
         
         # Modify Stem (First Conv Layer)
-        # Original: Conv2d(3, 96, kernel_size=(4, 4), stride=(4, 4))
-        original_stem = self.model.stem[0]
-        
-        new_stem = nn.Conv2d(
-            in_channels=12, 
-            out_channels=original_stem.out_channels, 
-            kernel_size=original_stem.kernel_size, 
-            stride=original_stem.stride,
-            padding=original_stem.padding,
-            bias=original_stem.bias is not None
-        )
-        
-        # Weights Initialization Strategy:
-        # We need to adapt the 3-channel weights to 12 channels.
-        # Strategy: Repeat the weights 4 times. 
-        # While not perfect, it's better than random init.
-        
-        with torch.no_grad():
-            if original_stem.weight is not None:
-                # (Out, In, kH, kW)
-                orig_w = original_stem.weight.data
-                # Repeat along In-channel dimension (dim 1) 4 times (3->12)
-                new_w = orig_w.repeat(1, 4, 1, 1)
-                # Scale by 1/4 to maintain variance
-                new_w = new_w / 4.0 
-                new_stem.weight.copy_(new_w)
-            
-            if original_stem.bias is not None:
-                new_stem.bias.copy_(original_stem.bias)
-                
-        self.model.stem[0] = new_stem
+        # Some timm variants return a FeatureListNet (features_only) wrapper
+        # that does not expose `.stem`. To be robust we search for the first
+        # Conv2d that expects 3 input channels and replace it with a Conv2d
+        # that accepts 12 channels, copying weights by repeating the RGB
+        # kernels 4x along the in_channel dimension.
+        replaced = False
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Conv2d) and getattr(module, 'in_channels', None) == 3:
+                original_stem = module
+                new_stem = nn.Conv2d(
+                    in_channels=12,
+                    out_channels=original_stem.out_channels,
+                    kernel_size=original_stem.kernel_size,
+                    stride=original_stem.stride,
+                    padding=original_stem.padding,
+                    bias=original_stem.bias is not None
+                )
+
+                with torch.no_grad():
+                    w = original_stem.weight  # (out_ch, in_ch=3, kH, kW)
+                    # Repeat the RGB kernels 4 times to form 12-channel weights
+                    new_w = w.repeat(1, 4, 1, 1) / 4.0
+                    # If shapes mismatch (rare), fallback to trimming/expanding
+                    if new_w.shape[1] != 12:
+                        if new_w.shape[1] > 12:
+                            new_w = new_w[:, :12, ...]
+                        else:
+                            # pad with repeated channels
+                            pad_times = 12 // new_w.shape[1]
+                            new_w = new_w.repeat(1, pad_times, 1, 1)
+                    new_stem.weight.copy_(new_w)
+                    if original_stem.bias is not None:
+                        new_stem.bias.copy_(original_stem.bias)
+
+                # Assign new_stem into model by resolving the named module path
+                parts = name.split('.')
+                parent = self.model
+                for p in parts[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, parts[-1], new_stem)
+                replaced = True
+                break
+
+        if not replaced:
+            # As a last resort, if we couldn't find a 3-channel conv, try to
+            # attach a new stem at attribute 'stem' if it exists, otherwise
+            # leave model unchanged and warn at runtime.
+            if hasattr(self.model, 'stem'):
+                try:
+                    original_stem = self.model.stem[0]
+                    new_stem = nn.Conv2d(in_channels=12, out_channels=original_stem.out_channels,
+                                         kernel_size=original_stem.kernel_size, stride=original_stem.stride,
+                                         padding=original_stem.padding, bias=original_stem.bias is not None)
+                    with torch.no_grad():
+                        w = original_stem.weight
+                        new_w = w.repeat(1, 4, 1, 1) / 4.0
+                        new_stem.weight.copy_(new_w[:, :12, ...])
+                        if original_stem.bias is not None:
+                            new_stem.bias.copy_(original_stem.bias)
+                    self.model.stem[0] = new_stem
+                    replaced = True
+                except Exception:
+                    replaced = False
+
+        if not replaced:
+            import warnings
+            warnings.warn('Could not automatically replace ConvNeXt stem to accept 12 channels. Proceeding without stem replacement.')
         
         # Determine channel dimensions
         # ConvNeXt-Tiny dims: [96, 192, 384, 768]
