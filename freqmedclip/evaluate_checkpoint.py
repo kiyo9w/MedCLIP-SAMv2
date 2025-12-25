@@ -76,15 +76,18 @@ def evaluate(checkpoint_path, dataset, data_root, batch_size, out_path, device, 
             else:
                 probs_unsq = probs
 
-            target_h, target_w = masks.shape[1], masks.shape[2]
-            if probs_unsq.shape[-2] != target_h or probs_unsq.shape[-1] != target_w:
-                probs_resized = F.interpolate(probs_unsq, size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(1)
+            target_h, target_w = probs.shape[1], probs.shape[2]
+            
+            # Resize masks if needed
+            if masks.shape[1] != target_h or masks.shape[2] != target_w:
+                masks_resized = F.interpolate(masks.unsqueeze(1), size=(target_h, target_w), mode='nearest').squeeze(1)
             else:
-                probs_resized = probs
+                masks_resized = masks
+            probs_final = probs
 
-            for i in range(probs_resized.shape[0]):
-                p = (probs_resized[i] > 0.5).float()
-                t = masks[i]
+            for i in range(probs_final.shape[0]):
+                p = (probs_final[i] > 0.5).float()
+                t = masks_resized[i]
                 intersection = (p * t).sum().item()
                 union = p.sum().item() + t.sum().item()
                 dice = (2. * intersection + 1e-8) / (union + 1e-8)

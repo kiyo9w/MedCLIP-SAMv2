@@ -60,15 +60,14 @@ def compute_metrics(checkpoint, dataset, data_root, batch_size, out_path, device
 
             # Resize probs to mask size
             B = probs.shape[0]
-            target_h, target_w = masks.shape[1], masks.shape[2]
-            probs_resized = F.interpolate(probs.unsqueeze(1), size=(target_h, target_w), mode='bilinear', align_corners=False).squeeze(1)
-            preds_bin = (probs_resized > 0.5).long()
-
-            # accumulate
-            TP += int(((preds_bin == 1) & (masks == 1)).sum().item())
-            FP += int(((preds_bin == 1) & (masks == 0)).sum().item())
-            FN += int(((preds_bin == 0) & (masks == 1)).sum().item())
-            TN += int(((preds_bin == 0) & (masks == 0)).sum().item())
+            # Resize masks to probs size (model output size)
+            target_h, target_w = probs.shape[1], probs.shape[2]
+            masks_resized = F.interpolate(masks.unsqueeze(1), size=(target_h, target_w), mode='nearest').squeeze(1)
+            preds_bin = (probs > 0.5).long()
+            TP += int(((preds_bin == 1) & (masks_resized == 1)).sum().item())
+            FP += int(((preds_bin == 1) & (masks_resized == 0)).sum().item())
+            FN += int(((preds_bin == 0) & (masks_resized == 1)).sum().item())
+            TN += int(((preds_bin == 0) & (masks_resized == 0)).sum().item())
 
     # compute metrics
     eps = 1e-8
