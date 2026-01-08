@@ -28,9 +28,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # Import our custom components
 from freqmedclip.scripts.freq_components import FPNAdapter, haar_dwt
-from freqmedclip.scripts.new_freq_encoder import ConvNeXtTiny12Ch # New Encoder
-from freqmedclip.scripts.fmiseg_components import FFBI, Decoder, SubpixelUpsample, UnetOutBlock
-from scripts.methods import vision_heatmap_iba
+from freqmedclip.scripts.new_freq_encoder import WaveletInjector
+from freqmedclip.scripts.fmiseg_components import (
+    FFBI, Decoder, SubpixelUpsample, UnetOutBlock,
+    SemanticAnchor, SmartSpatialGate
+)
 from saliency_maps.text_prompts import *
 from loss.hnl import HardNegativeLoss
 
@@ -179,296 +181,184 @@ class FreqMedCLIPDataset(Dataset):
             'img_name': img_name
         }
 
-# --- 2. Model Wrapper ---
+# --- 2. Model Wrapper (Smart Single-Stream Architecture) ---
 class FrequencyMedCLIPSAMv2(nn.Module):
-    def __init__(self, biomedclip_model, freq_encoder, fpn_adapter, args):
+    """
+    Smart Single-Stream FreqMedCLIP Architecture.
+    
+    Key changes from original dual-branch:
+    1. Uses WaveletInjector (lightweight) instead of ConvNeXtTiny12Ch (heavy)
+    2. Uses SemanticAnchor for feed-forward M2IB approximation
+    3. Uses SmartSpatialGate for semantic-first gating
+    4. Single decoder branch (removes redundant frequency decoder)
+    5. Uses 768-dim hidden_states instead of 512-dim pooler_output
+    
+    Data Flow:
+    Image -> BiomedCLIP -> Layer 3 (HF) + Layer 11 (LF)
+    Image -> DWT -> WaveletInjector -> F_wav
+    F_HF = Layer3 + F_wav
+    Anchor = SemanticAnchor(Layer11, Text_CLS)
+    Gated = SmartSpatialGate(Anchor, F_HF)
+    Output = Decoder(Gated, Text) -> Saliency Map
+    """
+    def __init__(self, biomedclip_model, args):
         super().__init__()
         self.biomedclip = biomedclip_model
-        self.freq_encoder = freq_encoder
-        self.fpn_adapter = fpn_adapter
-        
-        # --- Mandatory Text Projector (512 -> 768) ---
-        # Config says hidden=768, proj=512. BiomedCLIP outputs 512.
-        self.text_projector = nn.Linear(512, 768)
         
         # --- Freeze BiomedCLIP ---
         for param in self.biomedclip.parameters():
             param.requires_grad = False
         
-        # Unfreeze specific layers for multi-scale adaptation
-        layers_to_unfreeze = [3, 6, 9, 11] # 0-indexed
-        for i in layers_to_unfreeze:
-            for param in self.biomedclip.vision_model.encoder.layers[i].parameters():
-                param.requires_grad = True
-        self.biomedclip.vision_model.post_layernorm.requires_grad_(True)
+        # --- Smart Single-Stream Components ---
+        # Lightweight wavelet projection (replaces heavy ConvNeXt)
+        self.wavelet_injector = WaveletInjector(in_channels=12, out_channels=768)
         
-        # --- Dual-Branch Architecture (FMISeg-original) ---
+        # Feed-forward M2IB approximation (replaces iterative iba.py)
+        self.semantic_anchor = SemanticAnchor(dim=768)
         
+        # Semantic-first gating
+        self.smart_gate = SmartSpatialGate()
         
-        # self.spatial_dim = [14, 28, 56, 112] # OLD (224x224)
-        # NEW (512x512): 512/16 = 32. Pyramid: [32, 64, 128, 256]
-        self.spatial_dim = [32, 64, 128, 256] 
+        # FPN Adapter for multi-scale skip connections
+        self.fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96])
+        
+        # --- Single Decoder Branch ---
+        # Spatial dimensions for 224x224 input: 14, 28, 56, 112
+        # For 512x512: would be 32, 64, 128, 256 but we resize to 224
+        self.spatial_dim = [14, 28, 56, 112]
         feature_dim = [768, 384, 192, 96]
         
-        # Branch 1: Main (ViT)
-        self.decoder16 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77, embed_dim=768) # 768->384, 14->28
-        self.decoder8 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77, embed_dim=768)  # 384->192, 28->56
-        self.decoder4 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=768)  # 192->96,  56->112
-        self.decoder1 = SubpixelUpsample(2, feature_dim[3], 24, 2) # 96->24, 112->224 (scale=2)
+        # Single decoder path with LFFI for text guidance
+        self.decoder16 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77, embed_dim=768)
+        self.decoder8 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77, embed_dim=768)
+        self.decoder4 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=768)
+        self.decoder1 = SubpixelUpsample(2, feature_dim[3], 24, 2)
         self.out = UnetOutBlock(2, in_channels=24, out_channels=1)
         
-        # Branch 2: Frequency
-        self.decoder16_2 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77, embed_dim=768)
-        self.decoder8_2 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77, embed_dim=768)
-        self.decoder4_2 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=768)
-        self.decoder1_2 = SubpixelUpsample(2, feature_dim[3], 24, 2)
-        self.out_2 = UnetOutBlock(2, in_channels=24, out_channels=1)
-        
-        # FFBI (Bidirectional Interaction)
-        self.ffbi = FFBI(feature_dim[0], 4, True)
-
-        # Fusion Conv for High-Res Skip (96+96 -> 96)
-        self.fusion_conv = nn.Conv2d(feature_dim[3] * 2, feature_dim[3], kernel_size=1)
-        
     def get_high_freq_image(self, pixel_values):
-        # Use Haar Wavelet Transform (DWT) -> returns (B, 12, 112, 112)
+        """Apply Haar DWT to extract frequency domain features."""
+        # Returns (B, 12, H/2, W/2) - 4 subbands per RGB channel
         return haar_dwt(pixel_values)
 
     def forward(self, pixel_values, input_ids, image_raw):
-        # 1. Image Encoder (ViT) - Branch 1
-        # Ensure input spatial size matches BiomedCLIP's expected image size
+        """
+        Smart Single-Stream forward pass.
+        
+        Data Flow:
+        1. BiomedCLIP extracts Layer 3 (shallow/HF) and Layer 11 (deep/LF)
+        2. DWT + WaveletInjector creates wavelet features
+        3. F_HF = Layer3 + WaveletFeatures (enhanced high-frequency)
+        4. SemanticAnchor creates attention mask from Layer11 + Text
+        5. SmartSpatialGate applies semantic gating to F_HF
+        6. Single decoder path produces saliency map
+        """
+        # === 1. Get BiomedCLIP expected image size ===
         _, _, H, W = pixel_values.shape
-        expected_size = None
+        expected_size = 224  # BiomedCLIP default
         vm = self.biomedclip.vision_model
         if hasattr(vm, 'embeddings') and hasattr(vm.embeddings, 'image_size'):
             expected_size = vm.embeddings.image_size
         elif hasattr(self.biomedclip, 'config'):
-            # try common config locations
             cfg = getattr(self.biomedclip, 'config')
             if hasattr(cfg, 'vision_config') and getattr(cfg.vision_config, 'image_size', None) is not None:
                 expected_size = cfg.vision_config.image_size
-            elif getattr(cfg, 'image_size', None) is not None:
-                expected_size = cfg.image_size
 
-        if expected_size is None:
-            expected_size = 224
-
+        # Resize to BiomedCLIP expected size
         if H != expected_size or W != expected_size:
-            pixel_values = F.interpolate(pixel_values, size=(expected_size, expected_size), mode='bilinear', align_corners=False)
+            pixel_values = F.interpolate(pixel_values, size=(expected_size, expected_size), 
+                                        mode='bilinear', align_corners=False)
 
+        # === 2. Extract hidden states from BiomedCLIP (768-dim) ===
         vision_outputs = self.biomedclip.vision_model(pixel_values, output_hidden_states=True)
         hidden_states = vision_outputs.hidden_states
         
-        # Extract features for FPNAdapter: [3, 6, 9, 12]     
-        layers_idx = [12, 10, 7, 4]
+        # Layer 3 (shallow) for high-frequency details - remove CLS token
+        # Layer 11 (deep) for semantic features - remove CLS token
+        # hidden_states[i] shape: (B, num_patches+1, 768)
+        f_hf_raw = hidden_states[3][:, 1:, :]   # (B, 196, 768) for 224x224
+        f_lf_raw = hidden_states[11][:, 1:, :]  # (B, 196, 768) for 224x224
+        
+        # Reshape to spatial format: (B, N, C) -> (B, C, H, W)
+        B, N, C = f_lf_raw.shape
+        spatial_size = int(N ** 0.5)  # 14 for 224x224 input
+        f_hf = f_hf_raw.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)  # (B, 768, 14, 14)
+        f_lf = f_lf_raw.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)  # (B, 768, 14, 14)
+        
+        # === 3. DWT + Wavelet Injection ===
+        # Resize raw image to match BiomedCLIP input size
+        image_raw_resized = F.interpolate(image_raw, size=(expected_size, expected_size), 
+                                         mode='bilinear', align_corners=False)
+        dwt_feats = self.get_high_freq_image(image_raw_resized)  # (B, 12, 112, 112) for 224
+        f_wav = self.wavelet_injector(dwt_feats)  # (B, 768, 112, 112)
+        
+        # Resize wavelet features to match Layer 3 spatial size
+        f_wav = F.interpolate(f_wav, size=(spatial_size, spatial_size), mode='bilinear', align_corners=False)
+        
+        # Enhanced high-frequency features = Layer3 + Wavelet
+        f_hf_enhanced = f_hf + f_wav  # (B, 768, 14, 14)
+        
+        # === 4. Text Features (768-dim hidden states) ===
+        text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
+        # Get full text embeddings for decoder LFFI
+        text_embeds = text_outputs.hidden_states[-1]  # (B, seq_len, 768)
+        # Get CLS token for SemanticAnchor
+        text_cls = text_embeds[:, 0, :]  # (B, 768)
+        
+        # === 5. SemanticAnchor (M2IB approximation) ===
+        # Creates attention mask highlighting where text concept appears
+        anchor_map = self.semantic_anchor(f_lf, text_cls)  # (B, 1, 14, 14)
+        
+        # === 6. SmartSpatialGate ===
+        # Gates HF features using semantic anchor ("only edges inside target region")
+        gated_features = self.smart_gate(anchor_map, f_hf_enhanced)  # (B, 768, 14, 14)
+        
+        # === 7. Build FPN Pyramid from ViT layers for skip connections ===
+        # Extract multi-scale features from different layers
+        layers_idx = [12, 10, 7, 4]  # deep to shallow
         fpn_inputs = []
         for idx in layers_idx:
-            feat = hidden_states[idx][:, 1:, :] 
-            B, N, C = feat.shape
-            H = W = int(N**0.5) # 14
-            feat_reshaped = feat.permute(0, 2, 1).view(B, C, H, W)
+            feat = hidden_states[idx][:, 1:, :]  # Remove CLS
+            feat_reshaped = feat.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)
             fpn_inputs.append(feat_reshaped)
         
-        # FPN Adapter -> [s1(768), s2(384), s3(192), s4(96)]
-        fpn_feats = self.fpn_adapter(fpn_inputs)
-        image_features = fpn_feats # [s1, s2, s3, s4]
+        # FPN Adapter creates multi-scale features
+        fpn_feats = self.fpn_adapter(fpn_inputs)  # [768@14, 384@28, 192@56, 96@112]
         
-        # 2. Frequency Encoder - Branch 2
-        # Use Raw Image for DWT (Crucial fix)
-        # Resize raw image to the same spatial size used by the ViT encoder
-        # so that feature pyramids align spatially.
-        image_raw_resized = F.interpolate(image_raw, size=(expected_size, expected_size), mode='bilinear', align_corners=False)
-        img_h = self.get_high_freq_image(image_raw_resized) # image_raw is [0,1] tensor
+        # === 8. Single Decoder Path with text guidance ===
+        # Use gated features as the bottleneck input
+        bottleneck_flat = rearrange(gated_features, 'b c h w -> b (h w) c')
         
-        text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
-        text_embeds = text_outputs[0]
-
-        # Apply Text Projection if needed. Some BiomedCLIP text backbones already
-        # output 768-d vectors; others output 512-d. Handle both gracefully.
-        if hasattr(self.text_projector, 'in_features') and text_embeds.shape[-1] == self.text_projector.in_features:
-            text_embeds = self.text_projector(text_embeds)
-        elif text_embeds.shape[-1] == getattr(self.text_projector, 'out_features', 768):
-            # already projected to desired dim
-            pass
-        else:
-            # Fallback: create a temporary linear to project to desired dim
-            proj = nn.Linear(text_embeds.shape[-1], getattr(self.text_projector, 'out_features', 768)).to(text_embeds.device)
-            with torch.no_grad():
-                proj.weight.zero_(); proj.bias.zero_()
-            text_embeds = proj(text_embeds)
+        # Prepare skip connections
+        skips = [rearrange(item, 'b c h w -> b (h w) c') for item in fpn_feats]
         
-        # FrequencyEncoder returns [f3(14), f2(28), f1(56)]
-        # We assume FrequencyEncoder is updated to return 4 scales if we want full match, 
-        # but for now we use what we have and maybe pad or reuse?
-        # Actually, let's just use the 3 scales we have and maybe duplicate the last one?
-        # Or better, let's assume FrequencyEncoder returns [f3, f2, f1].
-        # f3(14, 768), f2(28, 384), f1(56, 192).
-        # We need s4(112, 96) equivalent.
-        # We can just use f1 upsampled? Or just None?
-        # Decoder expects a skip.
-        # ConvNeXtTiny12Ch returns [s4(768), s3(384), s2(192), s1(96)]
-        # We need to map these to Decoder expectations.
-        # Decoder expects: [s1, s2, s3, s4] where s1 is Bottleneck? 
-        # Wait, in Init:
-        # self.spatial_dim = [14, 28, 56, 112] (For 224 input)
-        # With 512 input:
-        # ViT-B/16: 512/16 = 32. So bottleneck is 32x32.
-        # FPNAdapter output matches ViT stages.
+        # Decoder 16: 768->384, 14x14->28x28
+        os16, _ = self.decoder16(bottleneck_flat, skips[1], text_embeds)
         
-        # For Frequency Branch:
-        # s4: 16x16 (768), s3: 32x32 (384), s2: 64x64 (192), s1: 128x128 (96)
-        
-        # Image Features 2 should correspond to:
-        # [Bottleneck, Skip1, Skip2, HighResSkip]
-        # Bottleneck = s4 (16x16) or s3 (32x32) to match ViT(32x32)?
-        # ViT bottleneck is 32x32. So we should use s3?
-        # But ConvNeXt is strong.
-        # Let's align with ViT stages.
-        # ViT features from FPNAdapter are [s1, s2, s3, s4] in original code (14, 28, 56, 112).
-        # Actually FPNAdapter in original code returns [s1(14), s2(28), s3(56), s4(112)].
-        # Here with 512 input, ViT features will be [32, 64, 128, 256] ? No.
-        # Layer 12 -> 32x32.
-        # So FPNAdapter will output [32, 64, 128, 256].
-        
-        # ConvNeXt returns features: [s4(768, 16x16), s3(384, 32x32), s2(192, 64x64), s1(96, 128x128)]
-        # Note: Resolutions above assume 512x512 input. 
-        # Since DWT halves input to 256x256, actual ConvNeXt feature sizes are:
-        # s4(8x8), s3(16x16), s2(32x32), s1(64x64)
-        
-        
-        # --- Semantic Alignment & Coarse Map ---
-        
-        # 1. Unpack Frequency Features
-        # With Dilated Convolutions (Stride 1 in Stages 2 & 3):
-        # DWT(256) -> s1(64) -> s2(32) -> s3(32) -> s4(32)
-        freq_feats = self.freq_encoder(img_h) 
-        s4, s3, s2, s1 = freq_feats # [768, 384, 192, 96]
-
-        # Ensure frequency high-level map (`s4`) matches ViT bottleneck spatial size
-        # so gating below broadcasts correctly.
-        vit_bottleneck = image_features[0]
-        _, _, vbH, vbW = vit_bottleneck.shape
-        if s4.shape[2] != vbH or s4.shape[3] != vbW:
-            s4 = F.interpolate(s4, size=(vbH, vbW), mode='bilinear', align_corners=False)
-        
-        # 2. Coarse Map Calculation (M2IB-style Text Guidance)
-        # This re-injects semantic awareness into the frequency branch as requested.
-        # Dot product of ViT Bottleneck (image_features[0]) and Text CLS token.
-        
-        vit_bottleneck = image_features[0] # (B, 768, 32, 32)
-        text_cls = text_embeds[:, 0, :]   # (B, 768) - Already projected to 768
-        
-        # (B, 768, 32, 32) * (B, 768, 1, 1) -> Sum(dim=1) -> (B, 1, 32, 32)
-        # This map highlights where the text thinks the object is.
-        coarse_map = (vit_bottleneck * text_cls.unsqueeze(-1).unsqueeze(-1)).sum(dim=1, keepdim=True)
-        coarse_map = torch.sigmoid(coarse_map) # Gate [0, 1]
-        
-        # 3. Gate the High-Level Frequency Features
-        # "Only look at edges where the ViT sees a tumor"
-        s4 = s4 * coarse_map 
-        
-        # 4. Alignment & Pyramid Construction
-        # Target: [Bottleneck(32x32), Skip1(64x64), Skip2(128x128), HighRes(256x256)]
-        
-        # s4 (32x32) -> Matches Bottleneck (32x32). No upsample needed!
-        bn = s4 
-        
-        # s3 (32x32) -> Needs 64x64. Upsample 2x.
-        sk1 = F.interpolate(s3, scale_factor=2, mode='bilinear', align_corners=False)
-        
-        # s2 (32x32) -> Needs 128x128. Upsample 4x.
-        sk2 = F.interpolate(s2, scale_factor=4, mode='bilinear', align_corners=False)
-        
-        # s1 (64x64) -> Needs 256x256. Upsample 4x.
-        f0  = F.interpolate(s1, scale_factor=4, mode='bilinear', align_corners=False)
-        
-        image_features2 = [bn, sk1, sk2, f0] 
-        # --- ALIGNMENT END ---
-        
-        # 3. Bottleneck Interaction (FFBI)
-        # My Bottleneck is index 0 (768, 14x14).
-        os32 = image_features[0]
-        os32_2 = image_features2[0]
-        
-        # Flatten for Attention: (B, C, H, W) -> (B, H*W, C) -> (B, L, C)
-        # FFBI expects (B, L, C) if batch_first=True.
-        
-        os32_flat = rearrange(os32, 'b c h w -> b (h w) c')
-        os32_2_flat = rearrange(os32_2, 'b c h w -> b (h w) c')
-        
-        fu32_flat, fu32_2_flat = self.ffbi(os32_flat, os32_2_flat)
-        
-        # 4. Decoding
-        # Branch 1
-        # Prepare skips (flatten)
-        skips = [rearrange(item, 'b c h w -> b (h w) c') for item in image_features]
-
-        # Align frequency branch pyramid spatial sizes to ViT branch before flattening
-        aligned_image_features2 = []
-        for ref, feat in zip(image_features, image_features2):
-            _, _, ref_h, ref_w = ref.shape
-            if feat.shape[2] != ref_h or feat.shape[3] != ref_w:
-                feat = F.interpolate(feat, size=(ref_h, ref_w), mode='bilinear', align_corners=False)
-            aligned_image_features2.append(feat)
-
-        skips2 = [rearrange(item, 'b c h w -> b (h w) c') for item in aligned_image_features2]
-        
-        # Decoder 16 (14->28)
-        # Branch 1
-        os16, _ = self.decoder16(fu32_flat, skips[1], text_embeds)
-        # Branch 2
-        os16_2, _ = self.decoder16_2(fu32_2_flat, skips2[1], text_embeds)
-        
-        # Decoder 8 (28->56)
+        # Decoder 8: 384->192, 28x28->56x56
         os8, _ = self.decoder8(os16, skips[2], text_embeds)
-        os8_2, _ = self.decoder8_2(os16_2, skips2[2], text_embeds)
         
-        # Decoder 4 (56->112)
-        # Cross-Injection
-        # Inject f0 (112x112) from Frequency Branch (image_features2[3]) into ViT Branch
-        # image_features2[3] is f0, which has shape (B, 96, 112, 112)
+        # Decoder 4: 192->96, 56x56->112x112
+        os4, _ = self.decoder4(os8, skips[3], text_embeds)
         
-        # Fusion Strategy: Fuse ViT (s4) and Freq (f0)
-        vit_s4 = image_features[3]   # (B, 96, 112, 112) - now valid
-        freq_f0 = image_features2[3] # (B, 96, 112, 112)
-        
-        fused_skip = torch.cat([vit_s4, freq_f0], dim=1)
-        fused_skip = self.fusion_conv(fused_skip)
-        
-        cnn_high_res_skip_flat = rearrange(fused_skip, 'b c h w -> b (h w) c')
-        os4, _ = self.decoder4(os8, cnn_high_res_skip_flat, text_embeds)
-        os4_2, _ = self.decoder4_2(os8_2, skips2[3], text_embeds)
-        
-        # Reshape for SubpixelUpsample (expects B, C, H, W)
-        # Decoder returns (B, HW, C).
-        # Last spatial size was 256 (spatial_dim[3]).
-        # Infer spatial size from token length instead of hardcoding (supports different input sizes)
+        # Reshape for SubpixelUpsample
         L4 = os4.shape[1]
         H4 = int(L4 ** 0.5)
-        W4 = H4
-        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=H4, W=W4)
-
-        L4_2 = os4_2.shape[1]
-        H4_2 = int(L4_2 ** 0.5)
-        W4_2 = H4_2
-        os4_2 = rearrange(os4_2, 'B (H W) C -> B C H W', H=H4_2, W=W4_2)
+        os4 = rearrange(os4, 'B (H W) C -> B C H W', H=H4, W=H4)
         
-        # Decoder 1 (112->224)
+        # Final upsample: 96->24, 112->224
         os1 = self.decoder1(os4)
-        os1_2 = self.decoder1_2(os4_2)
         
-        # Output
-        out = self.out(os1) # Logits (Sigmoid applied in loss or later)
-        out_2 = self.out_2(os1_2)
+        # Output head
+        out = self.out(os1)  # (B, 1, H, W) logits
         
-        # Prepare features for HNL (Contrastive Loss)
-        # Pool bottleneck features: (B, C, 14, 14) -> (B, C)
-        # Use fused features
-        fu32 = rearrange(fu32_flat, 'b (h w) c -> b c h w', h=14, w=14)
-        img_feats_pooled = F.adaptive_avg_pool2d(fu32, (1, 1)).squeeze(-1).squeeze(-1)
-        text_feats_pooled = text_embeds[:, 0, :] # Use [CLS] token
+        # === 9. Features for DHN-NCE Loss ===
+        # Pool bottleneck features for contrastive loss
+        img_feats_pooled = F.adaptive_avg_pool2d(gated_features, (1, 1)).squeeze(-1).squeeze(-1)  # (B, 768)
+        text_feats_pooled = text_cls  # (B, 768)
         
-        return out, out_2, img_feats_pooled, text_feats_pooled
+        # Return single output (no dual branch)
+        # Return None for second output to maintain backward compatibility
+        return out, None, img_feats_pooled, text_feats_pooled
 
 # --- 3. Loss Function ---
 class DiceLoss(nn.Module):
@@ -511,36 +401,34 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     biomedclip = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
     
-    # Initialize Components
-    print("Initializing Fusion Components...")
-    fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
-    
-    # Frequency Encoder (New ConvNeXt)
-    freq_encoder = ConvNeXtTiny12Ch(pretrained=True).to(device) # No more in_channels/base args needed meant for custom
-    
-    # Model Wrapper
-    model = FrequencyMedCLIPSAMv2(biomedclip, freq_encoder, fpn_adapter, args).to(device)
+    # Initialize Model (Smart Single-Stream Architecture)
+    print("Initializing Smart Single-Stream FreqMedCLIP...")
+    model = FrequencyMedCLIPSAMv2(biomedclip, args).to(device)
     
     # Dataset & DataLoader
     print(f"Loading Dataset: {args.dataset}...")
     train_dataset = FreqMedCLIPDataset(args.data_root, args.dataset, processor, tokenizer, split='train')
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0) 
     
-    # Optimizer
+    # Optimizer (Smart Single-Stream - trainable modules only)
     backbone_params = filter(lambda p: p.requires_grad, model.biomedclip.parameters())
-    decoder_params = list(model.decoder16.parameters()) + list(model.decoder8.parameters()) + \
-                     list(model.decoder4.parameters()) + list(model.decoder1.parameters()) + \
-                     list(model.out.parameters()) + \
-                     list(model.decoder16_2.parameters()) + list(model.decoder8_2.parameters()) + \
-                     list(model.decoder4_2.parameters()) + list(model.decoder1_2.parameters()) + \
-                     list(model.out_2.parameters()) + \
-                     list(model.freq_encoder.parameters()) + \
-                     list(model.fpn_adapter.parameters()) + \
-                     list(model.ffbi.parameters())
+    
+    # Trainable components: WaveletInjector, SemanticAnchor, SmartSpatialGate, FPN, Decoder
+    trainable_params = (
+        list(model.wavelet_injector.parameters()) +
+        list(model.semantic_anchor.parameters()) +
+        list(model.smart_gate.parameters()) +
+        list(model.fpn_adapter.parameters()) +
+        list(model.decoder16.parameters()) +
+        list(model.decoder8.parameters()) +
+        list(model.decoder4.parameters()) +
+        list(model.decoder1.parameters()) +
+        list(model.out.parameters())
+    )
                      
     optimizer = torch.optim.AdamW([
         {'params': backbone_params, 'lr': args.backbone_lr},
-        {'params': decoder_params, 'lr': args.lr}
+        {'params': trainable_params, 'lr': args.lr}
     ])
     
     # Loss
@@ -594,32 +482,27 @@ def main():
         
         for batch_idx, batch in enumerate(pbar):
             pixel_values = batch['pixel_values'].to(device)
-            image_raw = batch['image_raw'].to(device) # New input
+            image_raw = batch['image_raw'].to(device)
             input_ids = batch['input_ids'].to(device)
             masks = batch['mask'].to(device).float()
             
-            # Forward
-            preds1, preds2, img_feats, text_feats = model(pixel_values, input_ids, image_raw) 
-            preds1 = preds1.squeeze(1)
-            preds2 = preds2.squeeze(1)
+            # Forward (Smart Single-Stream - single output)
+            preds, _, img_feats, text_feats = model(pixel_values, input_ids, image_raw) 
+            preds = preds.squeeze(1)
+            
             # Resize ground-truth masks to match prediction spatial size
             if masks.dim() == 3:
-                masks_resized = F.interpolate(masks.unsqueeze(1), size=preds1.shape[-2:], mode='nearest').squeeze(1)
+                masks_resized = F.interpolate(masks.unsqueeze(1), size=preds.shape[-2:], mode='nearest').squeeze(1)
             else:
                 masks_resized = masks
             
-            # Loss (Deep Supervision on both branches)
-            loss_dice1 = dice_criterion(preds1, masks_resized)
-            loss_bce1 = bce_criterion(preds1, masks_resized)
-            
-            loss_dice2 = dice_criterion(preds2, masks_resized)
-            loss_bce2 = bce_criterion(preds2, masks_resized)
-            
+            # Loss (Single branch - simplified)
+            loss_dice = dice_criterion(preds, masks_resized)
+            loss_bce = bce_criterion(preds, masks_resized)
             loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
             
-            # Total Loss
-            # Total Loss (0.2 weight for frequency branch as per critique)
-            loss = (loss_dice1 + loss_bce1) + 0.2 * (loss_dice2 + loss_bce2) + 0.1 * loss_hnl
+            # Total Loss: Dice + BCE + DHN-NCE
+            loss = loss_dice + loss_bce + 0.1 * loss_hnl
             
             loss = loss / args.grad_accum_steps
             loss.backward()
@@ -629,7 +512,7 @@ def main():
                 optimizer.zero_grad()
             
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item(), 'd1': loss_dice1.item(), 'd2': loss_dice2.item()})
+            pbar.set_postfix({'loss': loss.item(), 'dice': loss_dice.item(), 'hnl': loss_hnl.item()})
             
             if args.dry_run:
                 print("Dry run completed successfully.")
@@ -649,9 +532,8 @@ def main():
                 input_ids = batch['input_ids'].to(device)
                 masks = batch['mask'].to(device).float()
                 
-                preds1, preds2, _, _ = model(pixel_values, input_ids, image_raw)
-                # Use Main Branch (preds1) for metrics
-                preds = preds1.squeeze(1)
+                preds, _, _, _ = model(pixel_values, input_ids, image_raw)
+                preds = preds.squeeze(1)
 
                 # Resize masks to prediction size
                 if masks.dim() == 3:
