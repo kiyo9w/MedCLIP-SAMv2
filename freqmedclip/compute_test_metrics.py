@@ -7,7 +7,9 @@ import numpy as np
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from train_freq_fusion import FreqMedCLIPDataset, FrequencyMedCLIPSAMv2, ConvNeXtTiny12Ch, FPNAdapter
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from train_freq_fusion import FreqMedCLIPDataset, FrequencyMedCLIPSAMv2
 from transformers import AutoProcessor, AutoTokenizer, AutoModel
 
 
@@ -18,9 +20,8 @@ def compute_metrics(checkpoint, dataset, data_root, batch_size, out_path, device
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     biomedclip = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
 
-    fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768,384,192,96]).to(device)
-    freq_encoder = ConvNeXtTiny12Ch(pretrained=False).to(device)
-    model = FrequencyMedCLIPSAMv2(biomedclip, freq_encoder, fpn_adapter, args=argparse.Namespace()).to(device)
+    # Smart Single-Stream Architecture (no separate freq_encoder or fpn_adapter needed)
+    model = FrequencyMedCLIPSAMv2(biomedclip, args=argparse.Namespace()).to(device)
 
     ckpt = torch.load(checkpoint, map_location=device)
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:

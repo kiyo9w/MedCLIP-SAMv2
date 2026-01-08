@@ -14,8 +14,7 @@ from matplotlib.gridspec import GridSpec
 # Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Import components
-from freqmedclip.scripts.freq_components import DWTForward, FrequencyEncoder, FPNAdapter, IDWTInverse
+# Import components (Smart Single-Stream Architecture)
 from freqmedclip.train_freq_fusion import FreqMedCLIPDataset, FrequencyMedCLIPSAMv2
 
 # Storage for intermediate outputs
@@ -81,13 +80,14 @@ def visualize_intermediate_steps(vis_dir, img_name, original_image, mask_np, pre
     pred1_vis = norm_tensor(pred1.squeeze(0) if len(pred1.shape) > 2 else pred1)
     ax3 = fig.add_subplot(gs[0, 2])
     ax3.imshow(pred1_vis, cmap='gray')
-    ax3.set_title('Pred (ViT Branch)')
+    ax3.set_title('Prediction (Smart Single-Stream)')
     ax3.axis('off')
     
+    # In Smart Single-Stream, pred2 is same as pred1 (no dual branch)
     pred2_vis = norm_tensor(pred2.squeeze(0) if len(pred2.shape) > 2 else pred2)
     ax4 = fig.add_subplot(gs[0, 3])
     ax4.imshow(pred2_vis, cmap='gray')
-    ax4.set_title('Pred (Freq Branch)')
+    ax4.set_title('Pred (Sigmoid)')
     ax4.axis('off')
     
     # Row 2: Frequency features (up to 4 channels)
@@ -152,15 +152,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     biomedclip = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(device)
     
-    # Initialize components
-    print("Initializing components...")
-    dwt = DWTForward().to(device)
-    idwt = IDWTInverse().to(device)
-    fpn_adapter = FPNAdapter(in_channels=768, out_channels=[768, 384, 192, 96]).to(device)
-    freq_encoder = FrequencyEncoder(in_channels=3, base_channels=96, text_dim=768).to(device)
-    
-    # Create model
-    model = FrequencyMedCLIPSAMv2(biomedclip, freq_encoder, fpn_adapter, args).to(device)
+    # Create model (Smart Single-Stream Architecture)
+    print("Initializing Smart Single-Stream model...")
+    model = FrequencyMedCLIPSAMv2(biomedclip, args).to(device)
     
     # Load checkpoint
     print(f"Loading checkpoint: {args.checkpoint}")
@@ -170,8 +164,14 @@ def main():
     # Also handle if checkpoint is full state dict or just model state dict
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
+    elif isinstance(checkpoint, dict) and all(k.startswith('module.') for k in checkpoint.keys()):
+        state_dict = {k.replace('module.', ''): v for k, v in checkpoint.items()}
     else:
         state_dict = checkpoint
+    
+    # Also strip module prefix from state_dict if present
+    if isinstance(state_dict, dict) and any(k.startswith('module.') for k in state_dict.keys()):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
         
     # Load state dict
     try:
@@ -234,21 +234,26 @@ def main():
                 else:
                     fpn_features_list.append(output.detach())
             
-            # Register hooks if available
+            # Register hooks if available (Smart Single-Stream uses wavelet_injector instead of freq_encoder)
             freq_hook_handle = None
             fpn_hook_handle = None
             
             try:
-                if hasattr(model, 'freq_encoder'):
+                if hasattr(model, 'wavelet_injector'):
+                    freq_hook_handle = model.wavelet_injector.register_forward_hook(freq_hook)
+                elif hasattr(model, 'freq_encoder'):
                     freq_hook_handle = model.freq_encoder.register_forward_hook(freq_hook)
                 if hasattr(model, 'fpn_adapter'):
                     fpn_hook_handle = model.fpn_adapter.register_forward_hook(fpn_hook)
             except:
                 pass
             
-            # Forward
-            preds1, preds2, _, _ = model(pixel_values, input_ids)
-            preds = (preds1 + preds2) / 2
+            # Forward (Smart Single-Stream - single output)
+            # Get image_raw from batch (needed for DWT)
+            image_raw = batch['image_raw'].to(device)
+            preds1, preds2, _, _ = model(pixel_values, input_ids, image_raw)
+            # Smart Single-Stream returns preds2 as None
+            preds = preds1 if preds2 is None else (preds1 + preds2) / 2
             preds = preds.squeeze(1)
             
             # Remove hooks
@@ -257,15 +262,25 @@ def main():
             if fpn_hook_handle is not None:
                 fpn_hook_handle.remove()
             
+            # Resize masks to match prediction size (model outputs 224x224, masks are 512x512)
+            if masks.shape[-2:] != preds.shape[-2:]:
+                masks_resized = F.interpolate(
+                    masks.unsqueeze(1).float(), 
+                    size=preds.shape[-2:], 
+                    mode='nearest'
+                ).squeeze(1)
+            else:
+                masks_resized = masks.float()
+            
             # Calculate metrics and save visualizations for each sample in batch
             for i in range(preds.shape[0]):
-                metrics = calculate_metrics(preds[i], masks[i])
+                metrics = calculate_metrics(preds[i], masks_resized[i])
                 all_metrics.append(metrics)
                 
                 # Save comprehensive visualization for first 5 samples + every 10th
                 if sample_count < 5 or sample_count % 10 == 0:
                     pred_binary = (torch.sigmoid(preds[i]) > 0.5).cpu().numpy()
-                    mask_np = masks[i].cpu().numpy()
+                    mask_np = masks_resized[i].cpu().numpy()
                     
                     # Get original image from batch for context
                     # Denormalize pixel_values to get image
@@ -278,6 +293,9 @@ def main():
                     fpn_feats = [f[i] for f in fpn_features_list] if fpn_features_list else []
                     
                     # Visualize all steps
+                    # Smart Single-Stream: show raw logits and sigmoid output
+                    pred1_viz = preds1[i] if preds1 is not None else preds[i]
+                    pred2_viz = torch.sigmoid(pred1_viz)  # Show sigmoid for second slot
                     visualize_intermediate_steps(
                         vis_dir, 
                         img_names[i],
@@ -286,8 +304,8 @@ def main():
                         pred_binary,
                         freq_feat,
                         fpn_feats if fpn_feats else None,
-                        preds1[i] if preds1 is not None else preds[i],
-                        preds2[i] if preds2 is not None else preds[i],
+                        pred1_viz,
+                        pred2_viz,
                         metrics
                     )
                 
