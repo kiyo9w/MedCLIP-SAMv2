@@ -269,8 +269,17 @@ class FrequencyMedCLIPSAMv2(nn.Module):
                                         mode='bilinear', align_corners=False)
 
         # === 2. Extract hidden states from BiomedCLIP (768-dim) ===
-        vision_outputs = self.biomedclip.vision_model(pixel_values, output_hidden_states=True)
-        hidden_states = vision_outputs.hidden_states
+        vision_outputs = self.biomedclip.vision_model(
+            pixel_values, 
+            output_hidden_states=True,
+            return_dict=True
+        )
+        # Handle both object and tuple outputs (transformers version compatibility)
+        if hasattr(vision_outputs, 'hidden_states'):
+            hidden_states = vision_outputs.hidden_states
+        else:
+            # Tuple format: (last_hidden_state, pooler_output, hidden_states)
+            hidden_states = vision_outputs[2] if len(vision_outputs) > 2 else vision_outputs[0]
         
         # Layer 3 (shallow) for high-frequency details - remove CLS token
         # Layer 11 (deep) for semantic features - remove CLS token
@@ -298,9 +307,19 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         f_hf_enhanced = f_hf + f_wav  # (B, 768, 14, 14)
         
         # === 4. Text Features (768-dim hidden states) ===
-        text_outputs = self.biomedclip.text_model(input_ids, output_hidden_states=True)
-        # Get full text embeddings for decoder LFFI
-        text_embeds = text_outputs.hidden_states[-1]  # (B, seq_len, 768)
+        # Call text_model with return_dict=True to get proper ModelOutput
+        text_outputs = self.biomedclip.text_model(
+            input_ids=input_ids, 
+            output_hidden_states=True,
+            return_dict=True
+        )
+        # Handle both object and tuple outputs (transformers version compatibility)
+        if hasattr(text_outputs, 'hidden_states'):
+            text_embeds = text_outputs.hidden_states[-1]  # (B, seq_len, 768)
+        else:
+            # Tuple format: (last_hidden_state, pooler_output, hidden_states)
+            # hidden_states is index 2, we want the last layer [-1]
+            text_embeds = text_outputs[2][-1] if len(text_outputs) > 2 else text_outputs[0]
         # Get CLS token for SemanticAnchor
         text_cls = text_embeds[:, 0, :]  # (B, 768)
         
