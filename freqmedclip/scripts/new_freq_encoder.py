@@ -1,6 +1,38 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
+
+
+class WaveletInjector(nn.Module):
+    """
+    Lightweight wavelet projection - preserves mathematical edge certainty.
+    
+    Replaces heavy ConvNeXtTiny12Ch with a simple 2-layer CNN that:
+    1. Uses 3x3 conv to mix spatial wavelet context
+    2. Uses 1x1 conv to align to target dimension (768)
+    
+    This is ~95% fewer parameters than ConvNeXt while preserving DWT edge information.
+    """
+    def __init__(self, in_channels=12, out_channels=768):
+        super().__init__()
+        self.projector = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // 4, out_channels, kernel_size=1)
+        )
+    
+    def forward(self, dwt_image):
+        """
+        Args:
+            dwt_image: (B, 12, H/2, W/2) - Output from haar_dwt (LL, LH, HL, HH for each RGB channel)
+        
+        Returns:
+            (B, 768, H/2, W/2) - Projected wavelet features
+        """
+        return self.projector(dwt_image)
+
 
 class ConvNeXtTiny12Ch(nn.Module):
     """
