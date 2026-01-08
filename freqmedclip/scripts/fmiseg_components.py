@@ -190,3 +190,93 @@ class FFBI(nn.Module):
         y1, _ = self.cross_attnh(query=y,key=x,value=x)
         y2 = y1+ y
         return x2,y2
+
+
+# --- Smart Single-Stream Components (FreqMedCLIP Refactor) ---
+
+class SemanticAnchor(nn.Module):
+    """
+    Feed-forward approximation of M2IB (Multi-modal Information Bottleneck) for training.
+    
+    The original M2IB in MedCLIP-SAMv2 (iba.py) uses iterative optimization per-sample at inference.
+    This module provides a differentiable, feed-forward alternative for end-to-end training.
+    
+    It computes a semantic attention map by:
+    1. Computing similarity between visual features and text CLS token
+    2. Generating a learnable gate from the similarity map
+    
+    CRITICAL: Input MUST be 768-dim hidden_states, NOT 512-dim pooler_output.
+    """
+    def __init__(self, dim=768):
+        super().__init__()
+        self.gate_gen = nn.Sequential(
+            nn.Conv2d(1, dim // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim // 4, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, visual_features, text_cls):
+        """
+        Args:
+            visual_features: (B, 768, H, W) - Deep semantic features from ViT Layer 11
+            text_cls: (B, 768) - Text CLS token from hidden_states (NOT pooler_output!)
+        
+        Returns:
+            anchor_map: (B, 1, H, W) - Semantic attention mask ("where the text says the object is")
+        """
+        # Broadcast text to spatial dimensions: (B, 768) -> (B, 768, 1, 1)
+        text_spatial = text_cls.unsqueeze(-1).unsqueeze(-1)
+        
+        # Compute similarity: element-wise product then sum across channels
+        # This highlights spatial locations where visual features align with text
+        similarity = (visual_features * text_spatial).sum(dim=1, keepdim=True)  # (B, 1, H, W)
+        
+        # Normalize similarity for stable gate generation
+        similarity = similarity / (similarity.abs().max() + 1e-8)
+        
+        # Generate learnable semantic anchor map
+        anchor_map = self.gate_gen(similarity)
+        
+        return anchor_map
+
+
+class SmartSpatialGate(nn.Module):
+    """
+    Gates high-frequency detail features using the semantic anchor map.
+    
+    Implements the "Semantic-First, Boundary-Second" philosophy:
+    - Only edges/textures INSIDE the semantic region are kept
+    - Irrelevant edges (e.g., bones when looking for tumors) are suppressed
+    
+    Includes a learnable residual weight to prevent complete signal suppression.
+    """
+    def __init__(self):
+        super().__init__()
+        # Learnable residual weight to prevent complete signal loss
+        # Initialized to 0.1 to allow some ungated features through
+        self.residual_weight = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, anchor_map, high_freq_features):
+        """
+        Args:
+            anchor_map: (B, 1, H_low, W_low) - Semantic anchor from SemanticAnchor module
+            high_freq_features: (B, C, H_high, W_high) - Enhanced HF features (Layer 3 + wavelet)
+        
+        Returns:
+            gated_features: (B, C, H_high, W_high) - Semantically gated HF features
+        """
+        # Upsample anchor to match high-frequency feature resolution
+        anchor_up = F.interpolate(
+            anchor_map, 
+            size=high_freq_features.shape[-2:],
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        # Apply gate with residual connection
+        # The residual allows some ungated information through for training stability
+        gated_features = high_freq_features * anchor_up + high_freq_features * self.residual_weight
+        
+        return gated_features
