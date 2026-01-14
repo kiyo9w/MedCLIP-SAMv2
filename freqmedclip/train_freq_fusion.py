@@ -306,28 +306,7 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         f_hf = f_hf_raw.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)  # (B, 768, 14, 14)
         f_lf = f_lf_raw.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)  # (B, 768, 14, 14)
         
-        # === 3. DWT + Wavelet Injection (SpecTr Logic) ===
-        # Resize raw image to match BiomedCLIP input size
-        image_raw_resized = F.interpolate(image_raw, size=(expected_size, expected_size), 
-                                         mode='bilinear', align_corners=False)
-        dwt_feats = self.get_high_freq_image(image_raw_resized)  # (B, 12, 112, 112) for 224
-        
-        # Step 1: Channel Spectral Gating
-        dwt_gated, _ = self.spectral_gate(dwt_feats, text_cls)
-        
-        # Step 2: Wavelet Injection (Project to 768)
-        f_wav = self.wavelet_injector(dwt_gated)  # (B, 768, 112, 112)
-        
-        # Step 3: Edge Head (on High-Res Wavelet Features)
-        edge_logits = self.edge_head(f_wav) # (B, 1, 112, 112)
-        
-        # Resize wavelet features to match Layer 3 spatial size for fusion
-        f_wav_low = F.interpolate(f_wav, size=(spatial_size, spatial_size), mode='bilinear', align_corners=False)
-        
-        # Enhanced high-frequency features = Layer3 + Wavelet
-        f_hf_enhanced = f_hf + f_wav_low  # (B, 768, 14, 14)
-        
-        # === 4. Text Features (768-dim hidden states) ===
+        # === 3. Text Features (768-dim hidden states) - MUST BE BEFORE SPECTRAL GATING ===
         # Call text_model with return_dict=True to get proper ModelOutput
         text_outputs = self.biomedclip.text_model(
             input_ids=input_ids, 
@@ -341,8 +320,29 @@ class FrequencyMedCLIPSAMv2(nn.Module):
             # Tuple format: (last_hidden_state, pooler_output, hidden_states)
             # hidden_states is index 2, we want the last layer [-1]
             text_embeds = text_outputs[2][-1] if len(text_outputs) > 2 else text_outputs[0]
-        # Get CLS token for SemanticAnchor
+        # Get CLS token for SemanticAnchor and Spectral Gating
         text_cls = text_embeds[:, 0, :]  # (B, 768)
+        
+        # === 4. DWT + Wavelet Injection (SpecTr Logic) ===
+        # Resize raw image to match BiomedCLIP input size
+        image_raw_resized = F.interpolate(image_raw, size=(expected_size, expected_size), 
+                                         mode='bilinear', align_corners=False)
+        dwt_feats = self.get_high_freq_image(image_raw_resized)  # (B, 12, 112, 112) for 224
+        
+        # Step 1: Channel Spectral Gating (uses text_cls)
+        dwt_gated, _ = self.spectral_gate(dwt_feats, text_cls)
+        
+        # Step 2: Wavelet Injection (Project to 768)
+        f_wav = self.wavelet_injector(dwt_gated)  # (B, 768, 112, 112)
+        
+        # Step 3: Edge Head (on High-Res Wavelet Features)
+        edge_logits = self.edge_head(f_wav) # (B, 1, 112, 112)
+        
+        # Resize wavelet features to match Layer 3 spatial size for fusion
+        f_wav_low = F.interpolate(f_wav, size=(spatial_size, spatial_size), mode='bilinear', align_corners=False)
+        
+        # Enhanced high-frequency features = Layer3 + Wavelet
+        f_hf_enhanced = f_hf + f_wav_low  # (B, 768, 14, 14)
         
         # === 5. SemanticAnchor (M2IB approximation) ===
         # Creates attention mask highlighting where text concept appears
@@ -440,7 +440,9 @@ def main():
     
     # Load BiomedCLIP from local model
     print("Loading BiomedCLIP from local model...")
-    model_name = "../saliency_maps/model"
+    # Get script directory and construct path to model
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_name = os.path.join(script_dir, "..", "saliency_maps", "model")
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     biomedclip = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
