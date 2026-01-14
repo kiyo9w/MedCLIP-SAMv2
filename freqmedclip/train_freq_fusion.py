@@ -33,6 +33,9 @@ from freqmedclip.scripts.fmiseg_components import (
     FFBI, Decoder, SubpixelUpsample, UnetOutBlock,
     SemanticAnchor, SmartSpatialGate
 )
+from freqmedclip.scripts.spectr_components import (
+    ChannelSpectralGate, EdgeHead, MorphologicalEdgeTarget, RecouplingLoss, LFFI
+)
 from saliency_maps.text_prompts import *
 from loss.hnl import HardNegativeLoss
 
@@ -213,10 +216,17 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Lightweight wavelet projection (replaces heavy ConvNeXt)
         self.wavelet_injector = WaveletInjector(in_channels=12, out_channels=768)
         
+        # SpecTr Module B: Channel Spectral Gating
+        self.spectral_gate = ChannelSpectralGate(in_channels=12, text_dim=768)
+        
+        # SpecTr Module D: Edge Head (High-Res HF Features)
+        self.edge_head = EdgeHead(in_channels=768)
+        
         # Feed-forward M2IB approximation (replaces iterative iba.py)
         self.semantic_anchor = SemanticAnchor(dim=768)
         
-        # Semantic-first gating
+        # Semantic-first gating (keeping legacy name, or replacing usage?)
+        # SpecTr uses ChannelSpectralGate (on DWT) + SmartSpatialGate (on HF) potentially
         self.smart_gate = SmartSpatialGate()
         
         # FPN Adapter for multi-scale skip connections
@@ -228,12 +238,15 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         self.spatial_dim = [14, 28, 56, 112]
         feature_dim = [768, 384, 192, 96]
         
-        # Single decoder path with LFFI for text guidance
+        # Multi-stage Semantic Injection (LFFI is used inside Decoder)
+        # Note: Decoder from fmiseg_components uses LFFI internally.
         self.decoder16 = Decoder(feature_dim[0], feature_dim[1], self.spatial_dim[0], 77, embed_dim=768)
         self.decoder8 = Decoder(feature_dim[1], feature_dim[2], self.spatial_dim[1], 77, embed_dim=768)
         self.decoder4 = Decoder(feature_dim[2], feature_dim[3], self.spatial_dim[2], 77, embed_dim=768)
         self.decoder1 = SubpixelUpsample(2, feature_dim[3], 24, 2)
-        self.out = UnetOutBlock(2, in_channels=24, out_channels=1)
+        
+        # Output Block with Edge Refinement (24 + 1 channels)
+        self.out = UnetOutBlock(2, in_channels=25, out_channels=1)
         
     def get_high_freq_image(self, pixel_values):
         """Apply Haar DWT to extract frequency domain features."""
@@ -293,18 +306,26 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         f_hf = f_hf_raw.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)  # (B, 768, 14, 14)
         f_lf = f_lf_raw.permute(0, 2, 1).view(B, C, spatial_size, spatial_size)  # (B, 768, 14, 14)
         
-        # === 3. DWT + Wavelet Injection ===
+        # === 3. DWT + Wavelet Injection (SpecTr Logic) ===
         # Resize raw image to match BiomedCLIP input size
         image_raw_resized = F.interpolate(image_raw, size=(expected_size, expected_size), 
                                          mode='bilinear', align_corners=False)
         dwt_feats = self.get_high_freq_image(image_raw_resized)  # (B, 12, 112, 112) for 224
-        f_wav = self.wavelet_injector(dwt_feats)  # (B, 768, 112, 112)
         
-        # Resize wavelet features to match Layer 3 spatial size
-        f_wav = F.interpolate(f_wav, size=(spatial_size, spatial_size), mode='bilinear', align_corners=False)
+        # Step 1: Channel Spectral Gating
+        dwt_gated, _ = self.spectral_gate(dwt_feats, text_cls)
+        
+        # Step 2: Wavelet Injection (Project to 768)
+        f_wav = self.wavelet_injector(dwt_gated)  # (B, 768, 112, 112)
+        
+        # Step 3: Edge Head (on High-Res Wavelet Features)
+        edge_logits = self.edge_head(f_wav) # (B, 1, 112, 112)
+        
+        # Resize wavelet features to match Layer 3 spatial size for fusion
+        f_wav_low = F.interpolate(f_wav, size=(spatial_size, spatial_size), mode='bilinear', align_corners=False)
         
         # Enhanced high-frequency features = Layer3 + Wavelet
-        f_hf_enhanced = f_hf + f_wav  # (B, 768, 14, 14)
+        f_hf_enhanced = f_hf + f_wav_low  # (B, 768, 14, 14)
         
         # === 4. Text Features (768-dim hidden states) ===
         # Call text_model with return_dict=True to get proper ModelOutput
@@ -343,20 +364,20 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # FPN Adapter creates multi-scale features
         fpn_feats = self.fpn_adapter(fpn_inputs)  # [768@14, 384@28, 192@56, 96@112]
         
-        # === 8. Single Decoder Path with text guidance ===
+        # === 8. Single Decoder Path with text guidance (SpecTr Module C: Injection) ===
         # Use gated features as the bottleneck input
         bottleneck_flat = rearrange(gated_features, 'b c h w -> b (h w) c')
         
         # Prepare skip connections
         skips = [rearrange(item, 'b c h w -> b (h w) c') for item in fpn_feats]
         
-        # Decoder 16: 768->384, 14x14->28x28
+        # Decoder 16: 768->384, 14x14->28x28 (Uses LFFI inside)
         os16, _ = self.decoder16(bottleneck_flat, skips[1], text_embeds)
         
-        # Decoder 8: 384->192, 28x28->56x56
+        # Decoder 8: 384->192, 28x28->56x56 (Uses LFFI inside)
         os8, _ = self.decoder8(os16, skips[2], text_embeds)
         
-        # Decoder 4: 192->96, 56x56->112x112
+        # Decoder 4: 192->96, 56x56->112x112 (Uses LFFI inside)
         os4, _ = self.decoder4(os8, skips[3], text_embeds)
         
         # Reshape for SubpixelUpsample
@@ -367,17 +388,21 @@ class FrequencyMedCLIPSAMv2(nn.Module):
         # Final upsample: 96->24, 112->224
         os1 = self.decoder1(os4)
         
-        # Output head
-        out = self.out(os1)  # (B, 1, H, W) logits
+        # === SpecTr Step 4: Edge Guided Refinement ===
+        # Concatenate edge_logits (upsampled) to output features
+        edge_logits_up = F.interpolate(edge_logits, size=os1.shape[-2:], mode='bilinear', align_corners=False)
+        os1_refined = torch.cat([os1, edge_logits_up], dim=1) # (B, 24+1, 224, 224)
         
-        # === 9. Features for DHN-NCE Loss ===
-        # Pool bottleneck features for contrastive loss
-        img_feats_pooled = F.adaptive_avg_pool2d(gated_features, (1, 1)).squeeze(-1).squeeze(-1)  # (B, 768)
-        text_feats_pooled = text_cls  # (B, 768)
+        # Output head
+        out = self.out(os1_refined)  # (B, 1, H, W) logits
+        
+        # === 9. Features for Recoupling Loss ===
+        # Return high-resolution fused features (os1) for ROI pooling
+        fused_features_high_res = os1 # (B, 24, 224, 224)
+        text_feats_cls = text_cls  # (B, 768)
         
         # Return single output (no dual branch)
-        # Return None for second output to maintain backward compatibility
-        return out, None, img_feats_pooled, text_feats_pooled
+        return out, edge_logits, fused_features_high_res, text_feats_cls
 
 # --- 3. Loss Function ---
 class DiceLoss(nn.Module):
@@ -432,9 +457,11 @@ def main():
     # Optimizer (Smart Single-Stream - trainable modules only)
     backbone_params = filter(lambda p: p.requires_grad, model.biomedclip.parameters())
     
-    # Trainable components: WaveletInjector, SemanticAnchor, SmartSpatialGate, FPN, Decoder
+    # Trainer params (include new modules)
     trainable_params = (
         list(model.wavelet_injector.parameters()) +
+        list(model.spectral_gate.parameters()) +
+        list(model.edge_head.parameters()) +
         list(model.semantic_anchor.parameters()) +
         list(model.smart_gate.parameters()) +
         list(model.fpn_adapter.parameters()) +
@@ -453,7 +480,9 @@ def main():
     # Loss
     dice_criterion = DiceLoss()
     bce_criterion = nn.BCEWithLogitsLoss()
-    hnl_criterion = HardNegativeLoss()
+    # SpecTr Losses
+    recoupling_criterion = RecouplingLoss(in_channels=24, text_dim=768) 
+    edge_target_gen = MorphologicalEdgeTarget()
     
     # Load checkpoint if resuming
     start_epoch = 0
@@ -505,9 +534,11 @@ def main():
             input_ids = batch['input_ids'].to(device)
             masks = batch['mask'].to(device).float()
             
-            # Forward (Smart Single-Stream - single output)
-            preds, _, img_feats, text_feats = model(pixel_values, input_ids, image_raw) 
+            # Forward (SpecTr Flow)
+            # Returns: mask_logits, edge_logits, fused_feats, text_feats
+            preds, edge_logits, fused_feats, text_feats = model(pixel_values, input_ids, image_raw) 
             preds = preds.squeeze(1)
+            edge_logits = edge_logits.squeeze(1)
             
             # Resize ground-truth masks to match prediction spatial size
             if masks.dim() == 3:
@@ -515,13 +546,27 @@ def main():
             else:
                 masks_resized = masks
             
-            # Loss (Single branch - simplified)
+            # Generate Edge Targets
+            edge_targets = edge_target_gen(masks_resized.unsqueeze(1)).squeeze(1)
+            # Resize edge logits to match targets (or vice versa - usually logits are high res 112x112 or 224x224)
+            # Edge Head outputs 112x112 (from wavelet injector). Masks are 224 or 512.
+            # Let's align edge target to edge logits (112x112)
+            edge_targets_aligned = F.interpolate(edge_targets.unsqueeze(1), size=edge_logits.shape[-2:], mode='nearest').squeeze(1)
+
+            # Segmentation Loss
             loss_dice = dice_criterion(preds, masks_resized)
             loss_bce = bce_criterion(preds, masks_resized)
-            loss_hnl = hnl_criterion(img_feats, text_feats, batch_size=pixel_values.shape[0])
             
-            # Total Loss: Dice + BCE + DHN-NCE
-            loss = loss_dice + loss_bce + 0.1 * loss_hnl
+            # Edge Loss (1.0 weight)
+            loss_edge_bce = bce_criterion(edge_logits, edge_targets_aligned)
+            loss_edge_dice = dice_criterion(edge_logits, edge_targets_aligned)
+            loss_edge = loss_edge_bce + loss_edge_dice
+            
+            # Recoupling Loss (0.1 weight)
+            loss_recouple = recoupling_criterion(fused_feats, preds.unsqueeze(1), text_feats)
+            
+            # Total Loss: Dice + BCE + Edge + Recouple
+            loss = loss_dice + loss_bce + 1.0 * loss_edge + 0.1 * loss_recouple
             
             loss = loss / args.grad_accum_steps
             loss.backward()
@@ -531,7 +576,7 @@ def main():
                 optimizer.zero_grad()
             
             epoch_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item(), 'dice': loss_dice.item(), 'hnl': loss_hnl.item()})
+            pbar.set_postfix({'l_seg': (loss_dice+loss_bce).item(), 'l_edge': loss_edge.item(), 'l_rcp': loss_recouple.item()})
             
             if args.dry_run:
                 print("Dry run completed successfully.")
